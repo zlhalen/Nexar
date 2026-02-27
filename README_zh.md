@@ -2,7 +2,7 @@
 
 ---
 
-# Nexar ⬛️: 为极客打造的白盒 AI 编辑器
+# Nexar Code ⬛️: 为极客打造的白盒 AI 编程助手
 
 [English](./README.md) / 简体中文
 

@@ -2,8 +2,8 @@
 
 ---
 
-# Nexar ⬛️
-The White-Box AI Editor
+# Nexar Code ⬛️
+The White-Box AI Coding Assistant
 
 English / [简体中文](./README_zh.md)
 
