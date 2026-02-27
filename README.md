@@ -1,8 +1,6 @@
 
 # Nexar ⬛️
 > The White-Box AI Editor for Hackers. | 为极客打造的白盒 AI 编辑器。
-> 
-> [👇 点击这里向下滚动查看中文简介 | Scroll down for Chinese version](#-nexar-中文介绍)
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 [![Status: v1.0 Alpha](https://img.shields.io/badge/Status-v1.0_Alpha-blue.svg)]()
