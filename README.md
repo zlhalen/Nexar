@@ -31,14 +31,7 @@ In Nexar, there is no "black-box magic". Everything is transparent.
 
 This is the v1.0 release. Install the core extension locally:
 
-```bash
-git clone https://github.com/yourusername/nexar.git
-cd nexar
-npm install
-npm run build
-```
-
-Then, configure your API keys or local AI endpoints in the `nexar.config.json` file.
+[Install](./install.md)
 
 ## 🗺 Roadmap & VIP Features
 
