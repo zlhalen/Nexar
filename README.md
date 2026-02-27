@@ -9,6 +9,8 @@ Tired of AI IDEs treating you like a beginner? Tired of hidden "system prompts" 
 
 **Nexar** is not just another AI coding assistant. It's a **white-box, highly hackable AI layer** built for senior developers. We believe the AI should be your executor, while *you* remain the architect. 
 
+![界面](docs/images/demo.png)
+
 ## 🎯 The Core Philosophy: See It, Tweak It, Control It
 
 In Nexar, there is no "black-box magic". Everything is transparent.
