@@ -81,6 +81,26 @@ def write_file(relative_path: str, content: str) -> FileContent:
     return FileContent(path=relative_path, content=content, language=_get_language(relative_path))
 
 
+def write_file_range(relative_path: str, replacement: str, start_line: int, end_line: int) -> FileContent:
+    if start_line < 1 or end_line < start_line:
+        raise ValueError("Invalid range: range_start/range_end must satisfy 1 <= range_start <= range_end")
+
+    current = read_file(relative_path)
+    lines = current.content.splitlines(keepends=True)
+
+    if not lines:
+        if start_line != 1 or end_line != 1:
+            raise ValueError("Invalid range for empty file: only 1-1 is allowed")
+        return write_file(relative_path, replacement)
+
+    total = len(lines)
+    if end_line > total:
+        raise ValueError(f"Invalid range: file has {total} lines, but range_end={end_line}")
+
+    new_content = "".join(lines[: start_line - 1]) + replacement + "".join(lines[end_line:])
+    return write_file(relative_path, new_content)
+
+
 def create_item(relative_path: str, is_dir: bool = False, content: str = "") -> bool:
     full_path = _safe_path(relative_path)
     if is_dir:

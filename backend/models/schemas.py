@@ -40,6 +40,14 @@ class DeleteRequest(BaseModel):
 class ChatMessage(BaseModel):
     role: str  # "user" | "assistant"
     content: str
+    chat_only: bool = False
+
+
+class CodeSnippet(BaseModel):
+    file_path: str
+    start_line: int
+    end_line: int
+    content: str
 
 
 class AIRequest(BaseModel):
@@ -47,8 +55,11 @@ class AIRequest(BaseModel):
     messages: list[ChatMessage]
     current_file: Optional[str] = None
     current_code: Optional[str] = None
-    action: str = "chat"  # "chat" | "generate" | "modify"
     file_path: Optional[str] = None
+    range_start: Optional[int] = None
+    range_end: Optional[int] = None
+    snippets: Optional[list[CodeSnippet]] = None
+    chat_only: bool = False
 
 
 class AIResponse(BaseModel):

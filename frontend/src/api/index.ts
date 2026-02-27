@@ -13,9 +13,18 @@ export interface FileContent {
   language?: string;
 }
 
+export interface CodeSnippet {
+  file_path: string;
+  start_line: number;
+  end_line: number;
+  content: string;
+}
+
 export interface ChatMessage {
   role: 'user' | 'assistant';
   content: string;
+  snippets?: CodeSnippet[];
+  chat_only?: boolean;
 }
 
 export interface AIRequest {
@@ -23,8 +32,11 @@ export interface AIRequest {
   messages: ChatMessage[];
   current_file?: string;
   current_code?: string;
-  action: string;
   file_path?: string;
+  range_start?: number;
+  range_end?: number;
+  snippets?: CodeSnippet[];
+  chat_only?: boolean;
 }
 
 export interface AIResponse {

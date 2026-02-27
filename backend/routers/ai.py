@@ -13,12 +13,36 @@ async def chat(req: AIRequest):
             messages=req.messages,
             current_file=req.current_file,
             current_code=req.current_code,
-            action=req.action,
             file_path=req.file_path,
+            snippets=req.snippets,
+            chat_only=req.chat_only,
+            range_start=req.range_start,
+            range_end=req.range_end,
         )
 
-        if result.file_path and result.file_content and result.action in ("generate", "modify"):
-            file_service.write_file(result.file_path, result.file_content)
+        if req.chat_only:
+            result.action = "chat"
+            result.file_path = None
+            result.file_content = None
+            return result
+
+        if result.file_content and result.action in ("generate", "modify"):
+            target_path = result.file_path or req.file_path or req.current_file
+            if not target_path:
+                raise ValueError("Missing file path for write operation")
+
+            if result.action == "modify" and req.range_start is not None and req.range_end is not None:
+                updated = file_service.write_file_range(
+                    target_path,
+                    result.file_content,
+                    req.range_start,
+                    req.range_end,
+                )
+            else:
+                updated = file_service.write_file(target_path, result.file_content)
+
+            result.file_path = target_path
+            result.file_content = updated.content
 
         return result
     except ValueError as e:

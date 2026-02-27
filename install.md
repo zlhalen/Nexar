@@ -1,4 +1,4 @@
-# AI CodeGen - 智能编程助手 (VIP)
+# Nexar Code - 智能编程助手 (VIP)
 
 一套前后端分离的 AI 编程助手系统。React 前端提供 VS Code 风格的代码编辑器与 AI 对话窗口，Python FastAPI 后端对接多模型（OpenAI / Claude / 自定义），支持代码目录管理、文件管理、语法高亮、AI 生成文件和修改文件。
 
