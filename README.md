@@ -1,6 +1,11 @@
+![界面](docs/images/logo.png)
+
+---
 
 # Nexar ⬛️
 The White-Box AI Editor
+
+English / [简体中文](./README_zh.md)
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 [![Status: v1.0 Alpha](https://img.shields.io/badge/Status-v1.0_Alpha-blue.svg)]()
