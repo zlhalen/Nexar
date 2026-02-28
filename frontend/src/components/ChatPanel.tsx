@@ -1,9 +1,9 @@
 import React, { useState, useRef, useEffect } from 'react';
 import {
   Send, Bot, User, Sparkles, FileCode,
-  Loader2, Settings, Trash2, GitCompare, X, Plus,
+  Loader2, Settings, Trash2, GitCompare, X, Plus, ListTodo, Play,
 } from 'lucide-react';
-import type { ChatMessage, AIResponse, Provider, CodeSnippet } from '../api';
+import type { ChatMessage, AIResponse, Provider, CodeSnippet, PlanBlock } from '../api';
 
 interface Props {
   chatTabs: Array<{ id: string; title: string }>;
@@ -18,13 +18,16 @@ interface Props {
   providers: Provider[];
   currentProvider: string;
   onProviderChange: (id: string) => void;
-  onSend: (message: string, options?: { snippets?: CodeSnippet[]; chatOnly?: boolean }) => void;
+  onSend: (message: string, options?: { snippets?: CodeSnippet[]; chatOnly?: boolean; planningMode?: boolean }) => void;
   onClear: () => void;
   activeFile: string | null;
   lastAIResult: AIResponse | null;
+  activePlan: PlanBlock | null;
+  planRunning: boolean;
   onApplyFile: (path: string, content: string) => void;
   onShowDiff?: (path: string, oldContent: string, newContent: string) => void;
   getCurrentFileContent?: (path: string) => string | undefined;
+  onExecutePlan: () => void;
 }
 
 function MarkdownContent({ text }: { text: string }) {
@@ -74,10 +77,12 @@ export default function ChatPanel({
   draftSnippets, onDraftSnippetsChange,
   messages, loading, providers, currentProvider,
   onProviderChange, onSend, onClear, activeFile,
-  lastAIResult, onApplyFile, onShowDiff, getCurrentFileContent,
+  lastAIResult, activePlan, planRunning, onApplyFile, onShowDiff, getCurrentFileContent,
+  onExecutePlan,
 }: Props) {
   const [input, setInput] = useState('');
   const [chatOnly, setChatOnly] = useState(false);
+  const [planningMode, setPlanningMode] = useState(false);
   const [showSettings, setShowSettings] = useState(false);
   const scrollRef = useRef<HTMLDivElement>(null);
   const inputRef = useRef<HTMLTextAreaElement>(null);
@@ -127,6 +132,7 @@ export default function ChatPanel({
     onSend(msg, {
       snippets: draftSnippets,
       chatOnly,
+      planningMode,
     });
     setInput('');
     onDraftSnippetsChange([]);
@@ -264,6 +270,13 @@ export default function ChatPanel({
                       </span>
                     </div>
                   )}
+                  {msg.planning_mode && (
+                    <div>
+                      <span className="inline-flex items-center rounded-md bg-white/15 px-2 py-0.5 text-[11px]">
+                        Planning
+                      </span>
+                    </div>
+                  )}
                   <p className="text-sm whitespace-pre-wrap">{msg.content}</p>
                 </div>
               )}
@@ -272,7 +285,7 @@ export default function ChatPanel({
         ))}
 
         {/* File action result - 仅在非仅对话模式下显示 */}
-        {!chatOnly && lastAIResult?.file_path && lastAIResult?.file_content && (
+        {!chatOnly && lastAIResult?.action !== 'plan' && lastAIResult?.file_path && lastAIResult?.file_content && (
           <div className="bg-sidebar-bg border border-accent/30 rounded-lg p-3">
             <div className="flex items-center gap-2 mb-3">
               <FileCode size={14} className="text-accent" />
@@ -303,6 +316,122 @@ export default function ChatPanel({
           </div>
         )}
 
+        {activePlan && (
+          <div className="bg-sidebar-bg border border-[#42607f] rounded-lg p-3 space-y-3">
+            <div className="flex items-center gap-2">
+              <ListTodo size={14} className="text-[#9ec6ff]" />
+              <span className="text-sm font-medium text-[#d7e9ff]">Planning（VIP 基础版）</span>
+              <button
+                onClick={onExecutePlan}
+                disabled={loading || planRunning}
+                className="ml-auto inline-flex items-center gap-1 text-xs px-2.5 py-1 rounded bg-[#3d5f86] text-white hover:bg-[#4d77a8] disabled:opacity-40 disabled:cursor-not-allowed"
+                title="按子计划顺序执行整个计划"
+              >
+                <Play size={11} />
+                {planRunning ? '执行中...' : '执行整个计划'}
+              </button>
+            </div>
+
+            <div>
+              <div className="text-[11px] text-text-secondary mb-1">目标</div>
+              <div className="text-sm text-text-primary">{activePlan.summary || '未提供摘要'}</div>
+            </div>
+
+            {activePlan.milestones.length > 0 && (
+              <div>
+                <div className="text-[11px] text-text-secondary mb-1">里程碑</div>
+                <div className="space-y-1">
+                  {activePlan.milestones.map((m, i) => (
+                    <div key={`${m}-${i}`} className="text-sm text-text-primary">• {m}</div>
+                  ))}
+                </div>
+              </div>
+            )}
+
+            {activePlan.steps.length > 0 && (
+              <div>
+                <div className="text-[11px] text-text-secondary mb-1">步骤</div>
+                <div className="space-y-2">
+                  {activePlan.steps.map((step, i) => (
+                    <div key={`${step.title}-${i}`} className="rounded border border-border-color bg-active-bg px-2 py-1.5">
+                      <div className="flex items-center gap-2">
+                        <span className={`inline-flex text-[11px] px-1.5 py-0.5 rounded ${
+                          step.status === 'completed'
+                            ? 'bg-success/20 text-success'
+                            : step.status === 'in_progress'
+                              ? 'bg-accent/20 text-accent'
+                              : step.status === 'partial'
+                                ? 'bg-amber-500/20 text-amber-300'
+                              : step.status === 'failed'
+                                ? 'bg-red-500/20 text-red-300'
+                                : 'bg-white/10 text-text-secondary'
+                        }`}>
+                          {step.status || 'pending'}
+                        </span>
+                        <div className="text-sm text-text-primary">{i + 1}. {step.title}</div>
+                      </div>
+                      {step.detail && <div className="text-xs text-text-secondary mt-1">{step.detail}</div>}
+                      {step.acceptance && <div className="text-xs text-success mt-1">验收: {step.acceptance}</div>}
+                      {step.summary && (
+                        <div className="text-xs text-[#b8d8ff] mt-1 whitespace-pre-wrap">{step.summary}</div>
+                      )}
+                      {step.error && (
+                        <div className="text-xs text-red-300 mt-1">错误: {step.error}</div>
+                      )}
+                      {step.changes && step.changes.length > 0 && (
+                        <div className="mt-2 space-y-1.5">
+                          <div className="text-[11px] text-text-secondary">
+                            文件变更: {step.changes.filter(c => c.write_result === 'written').length} 成功 / {step.changes.filter(c => c.write_result === 'failed').length} 失败
+                          </div>
+                          {step.changes.map((change, cIdx) => (
+                            <div key={`${change.file_path}-${cIdx}`} className="rounded border border-[#3c4a5a] bg-[#1d232d] px-2 py-1.5">
+                              <div className="flex items-center gap-2">
+                                <span className={`inline-flex text-[10px] px-1.5 py-0.5 rounded ${
+                                  change.write_result === 'written'
+                                    ? 'bg-success/20 text-success'
+                                    : 'bg-red-500/20 text-red-300'
+                                }`}>
+                                  {change.write_result}
+                                </span>
+                                <span className="text-xs text-text-primary font-mono">{change.file_path}</span>
+                                {change.before_content !== undefined && change.after_content !== undefined && onShowDiff && (
+                                  <button
+                                    onClick={() => onShowDiff(change.file_path, change.before_content || '', change.after_content || '')}
+                                    className="ml-auto text-[10px] px-2 py-0.5 rounded bg-accent text-white hover:bg-accent-hover"
+                                  >
+                                    查看 diff
+                                  </button>
+                                )}
+                              </div>
+                              {(change.before_hash || change.after_hash) && (
+                                <div className="text-[10px] text-text-secondary mt-1 font-mono">
+                                  {`before:${(change.before_hash || '').slice(0, 10)} after:${(change.after_hash || '').slice(0, 10)}`}
+                                </div>
+                              )}
+                              {change.error && <div className="text-[10px] text-red-300 mt-1">{change.error}</div>}
+                            </div>
+                          ))}
+                        </div>
+                      )}
+                    </div>
+                  ))}
+                </div>
+              </div>
+            )}
+
+            {activePlan.risks.length > 0 && (
+              <div>
+                <div className="text-[11px] text-text-secondary mb-1">风险</div>
+                <div className="space-y-1">
+                  {activePlan.risks.map((risk, i) => (
+                    <div key={`${risk}-${i}`} className="text-sm text-text-primary">• {risk}</div>
+                  ))}
+                </div>
+              </div>
+            )}
+          </div>
+        )}
+
         {loading && (
           <div className="flex gap-2">
             <div className="w-7 h-7 rounded-full bg-success/20 flex items-center justify-center flex-shrink-0">
@@ -327,7 +456,13 @@ export default function ChatPanel({
               type="button"
               role="switch"
               aria-checked={chatOnly}
-              onClick={() => setChatOnly(v => !v)}
+              onClick={() => {
+                setChatOnly(v => {
+                  const next = !v;
+                  if (next) setPlanningMode(false);
+                  return next;
+                });
+              }}
               className={`relative inline-flex h-5 w-9 items-center rounded-full border p-0 transition-colors ${
                 chatOnly
                   ? 'bg-accent/70 border-accent/80'
@@ -345,6 +480,36 @@ export default function ChatPanel({
           </label>
           {chatOnly && (
             <span className="text-[10px] text-text-secondary">（仅对话模式下不会修改代码）</span>
+          )}
+          <label className="flex items-center gap-2 cursor-pointer select-none ml-2">
+            <button
+              type="button"
+              role="switch"
+              aria-checked={planningMode}
+              onClick={() => {
+                setPlanningMode(v => {
+                  const next = !v;
+                  if (next) setChatOnly(false);
+                  return next;
+                });
+              }}
+              className={`relative inline-flex h-5 w-9 items-center rounded-full border p-0 transition-colors ${
+                planningMode
+                  ? 'bg-[#4d6f95] border-[#6e95c0]'
+                  : 'bg-[#3b3b3b] border-[#444]'
+              }`}
+              title="切换 planning"
+            >
+              <span
+                className={`absolute top-0.5 h-4 w-4 rounded-full bg-white transition-transform ${
+                  planningMode ? 'translate-x-4' : 'translate-x-0.5'
+                }`}
+              />
+            </button>
+            <span className="text-xs text-text-secondary">Planning(VIP)</span>
+          </label>
+          {planningMode && (
+            <span className="text-[10px] text-text-secondary">（只输出计划，不直接改代码）</span>
           )}
         </div>
 
@@ -368,6 +533,9 @@ export default function ChatPanel({
                 </div>
               ))}
             </div>
+            <div className="text-[10px] text-text-secondary">
+              写“重构这部分/改这几行”会优先修改引用范围；写“参考这段”会把 snippet 当上下文参考
+            </div>
           </div>
         )}
 
@@ -378,9 +546,13 @@ export default function ChatPanel({
             className="flex-1 bg-active-bg text-text-primary text-sm px-3 py-2 rounded-lg border border-border-color outline-none focus:border-accent resize-none"
             rows={2}
             placeholder={
-              chatOnly
-                ? '输入消息... (Enter发送, Shift+Enter换行)'
-                : '在编辑器复制后粘贴到这里，可自动附带文件与行号片段'
+              planningMode
+                ? 'Planning 模式：输入复杂需求，AI 将先输出执行计划'
+                : chatOnly
+                ? '仅对话模式：输入问题（不会改代码）'
+                : draftSnippets.length > 0
+                  ? '已引用 snippet：可写“重构这部分”或“参考这段分析下”'
+                  : '在编辑器复制后粘贴到这里，可自动附带文件与行号片段'
             }
             value={input}
             onChange={e => setInput(e.target.value)}

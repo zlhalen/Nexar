@@ -3,7 +3,7 @@ import json
 import re
 import logging
 from datetime import datetime
-from backend.models.schemas import AIProvider, ChatMessage, AIResponse, CodeSnippet
+from backend.models.schemas import AIProvider, ChatMessage, AIResponse, CodeSnippet, PlanBlock, PlanStep, FileChange
 
 logger = logging.getLogger("ai_service")
 
@@ -50,13 +50,52 @@ SYSTEM_PROMPT = """你是一个专业的AI编程助手。你可以帮助用户�
 }
 ```
 
+如需在一步中修改多个文件，可返回：
+```json
+{
+  "action": "modify",
+  "changes": [
+    { "file_path": "a.py", "file_content": "..." },
+    { "file_path": "b.py", "file_content": "..." }
+  ],
+  "explanation": "简要说明"
+}
+```
+
 当用户只是提问或聊天时，直接用普通文字回复即可。
+
+当用户要求进入 planning/规划模式时，请严格按照以下JSON格式返回（不要添加多余文字）：
+```json
+{
+  "action": "plan",
+  "plan": {
+    "summary": "一句话目标摘要",
+    "milestones": ["里程碑1", "里程碑2"],
+    "steps": [
+      {
+        "title": "步骤标题",
+        "detail": "具体执行说明",
+        "status": "pending",
+        "acceptance": "完成标准"
+      }
+    ],
+    "risks": ["风险1", "风险2"]
+  },
+  "explanation": "对计划的简要说明"
+}
+```
 
 注意事项：
 - 生成的代码要完整、可运行
 - 普通修改时返回修改后的完整文件内容
 - 当请求包含范围修改要求时，file_content 只返回“指定范围的替换内容”，不要返回整文件
 - 当请求是“仅对话模式”时，只做解释与建议，不要返回任何文件修改内容
+- 当请求是“planning模式”时，只返回计划，不要返回任何文件修改内容
+- 当用户明确说“这几行/这部分/这些片段/就改这里/只改引用”时，视为“片段定向修改”：
+  1) 优先只改引用片段对应范围
+  2) 不做整文件重构、跨函数大搬移、无关格式化
+  3) 若必须改范围外才能成立，不直接改文件，改为自然语言解释需要额外调整的原因与建议
+- 当用户未明确要求“只改引用片段”时，引用片段默认仅作为上下文参考，按用户真实意图决定是回答问题还是修改代码
 - file_path使用相对路径
 - 代码要符合最佳实践，有适当注释"""
 
@@ -78,6 +117,7 @@ def _build_messages(
     file_path: str | None,
     snippets: list[CodeSnippet] | None = None,
     chat_only: bool = False,
+    planning_mode: bool = False,
     range_start: int | None = None,
     range_end: int | None = None,
 ) -> list[dict]:
@@ -113,6 +153,13 @@ def _build_messages(
             "\n\n[当前请求为仅对话模式]"
             "\n[你必须只返回自然语言回答，不得返回可落盘的文件修改结果]"
             "\n[不要返回 action=modify/generate 的 JSON 结构]"
+        )
+    if planning_mode:
+        context += (
+            "\n\n[当前请求为 planning 模式]"
+            "\n[你必须只输出规划结果，action 必须为 plan]"
+            "\n[不得返回可落盘的文件修改结果]"
+            "\n[steps 中的 status 统一先用 pending]"
         )
 
     snippet_focused = _is_snippet_focused_intent(messages) if snippets else False
@@ -179,9 +226,13 @@ def _infer_action(
     file_path: str | None,
     snippets: list[CodeSnippet] | None,
     chat_only: bool,
+    planning_mode: bool,
     range_start: int | None,
     range_end: int | None,
 ) -> str:
+    if planning_mode:
+        return "plan"
+
     if chat_only:
         return "chat"
 
@@ -203,22 +254,71 @@ def _infer_action(
 def _parse_ai_response(raw: str, action: str) -> AIResponse:
     json_match = re.search(r'```json\s*\n?(.*?)\n?\s*```', raw, re.DOTALL)
     if not json_match:
-        json_match = re.search(r'\{[^{}]*"action"[^{}]*"file_path"[^{}]*\}', raw, re.DOTALL)
+        json_match = re.search(r'\{[\s\S]*"action"[\s\S]*\}', raw, re.DOTALL)
 
     if json_match:
         try:
             text = json_match.group(1) if '```' in json_match.group(0) else json_match.group(0)
             data = json.loads(text)
+            plan_data = data.get("plan")
+            plan = None
+            if isinstance(plan_data, dict):
+                steps_data = plan_data.get("steps", [])
+                steps: list[PlanStep] = []
+                if isinstance(steps_data, list):
+                    for step in steps_data:
+                        if isinstance(step, dict) and step.get("title"):
+                            steps.append(
+                                PlanStep(
+                                    title=str(step.get("title")),
+                                    detail=step.get("detail"),
+                                    status=str(step.get("status", "pending")),
+                                    acceptance=step.get("acceptance"),
+                                )
+                            )
+                plan = PlanBlock(
+                    summary=str(plan_data.get("summary", "")),
+                    milestones=[str(x) for x in plan_data.get("milestones", []) if isinstance(x, (str, int, float))],
+                    steps=steps,
+                    risks=[str(x) for x in plan_data.get("risks", []) if isinstance(x, (str, int, float))],
+                )
+            changes_data = data.get("changes")
+            changes = None
+            if isinstance(changes_data, list):
+                parsed_changes: list[FileChange] = []
+                for item in changes_data:
+                    if isinstance(item, dict) and item.get("file_path") and item.get("file_content") is not None:
+                        parsed_changes.append(
+                            FileChange(
+                                file_path=str(item.get("file_path")),
+                                file_content=str(item.get("file_content")),
+                            )
+                        )
+                if parsed_changes:
+                    changes = parsed_changes
+
             return AIResponse(
                 content=data.get("explanation", raw),
                 file_path=data.get("file_path"),
                 file_content=data.get("file_content"),
                 action=data.get("action", action),
+                plan=plan,
+                changes=changes,
             )
         except (json.JSONDecodeError, AttributeError):
             pass
 
-    return AIResponse(content=raw, action="chat")
+    stripped = raw.strip()
+    if stripped.startswith("{") and stripped.endswith("}"):
+        try:
+            data = json.loads(stripped)
+            if isinstance(data, dict) and "action" in data:
+                return _parse_ai_response(f"```json\n{stripped}\n```", action)
+        except json.JSONDecodeError:
+            pass
+
+    fallback_action = "plan" if action == "plan" else "chat"
+    return AIResponse(content=raw, action=fallback_action)
 
 
 async def call_openai(messages: list[dict]) -> str:
@@ -433,11 +533,15 @@ async def chat(
     file_path: str | None = None,
     snippets: list[CodeSnippet] | None = None,
     chat_only: bool = False,
+    planning_mode: bool = False,
     range_start: int | None = None,
     range_end: int | None = None,
 ) -> AIResponse:
-    action = _infer_action(messages, current_file, file_path, snippets, chat_only, range_start, range_end)
-    built = _build_messages(messages, current_file, current_code, action, file_path, snippets, chat_only, range_start, range_end)
+    action = _infer_action(messages, current_file, file_path, snippets, chat_only, planning_mode, range_start, range_end)
+    built = _build_messages(
+        messages, current_file, current_code, action, file_path,
+        snippets, chat_only, planning_mode, range_start, range_end
+    )
 
     callers = {
         AIProvider.OPENAI: call_openai,

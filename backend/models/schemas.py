@@ -1,4 +1,4 @@
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 from typing import Optional
 from enum import Enum
 
@@ -50,6 +50,18 @@ class CodeSnippet(BaseModel):
     content: str
 
 
+class FileChange(BaseModel):
+    file_path: str
+    file_content: str
+    before_content: Optional[str] = None
+    after_content: Optional[str] = None
+    diff_unified: Optional[str] = None
+    before_hash: Optional[str] = None
+    after_hash: Optional[str] = None
+    write_result: str = "written"
+    error: Optional[str] = None
+
+
 class AIRequest(BaseModel):
     provider: AIProvider = AIProvider.OPENAI
     messages: list[ChatMessage]
@@ -60,6 +72,21 @@ class AIRequest(BaseModel):
     range_end: Optional[int] = None
     snippets: Optional[list[CodeSnippet]] = None
     chat_only: bool = False
+    planning_mode: bool = False
+
+
+class PlanStep(BaseModel):
+    title: str
+    detail: Optional[str] = None
+    status: str = "pending"
+    acceptance: Optional[str] = None
+
+
+class PlanBlock(BaseModel):
+    summary: str
+    milestones: list[str] = Field(default_factory=list)
+    steps: list[PlanStep] = Field(default_factory=list)
+    risks: list[str] = Field(default_factory=list)
 
 
 class AIResponse(BaseModel):
@@ -67,3 +94,5 @@ class AIResponse(BaseModel):
     file_path: Optional[str] = None
     file_content: Optional[str] = None
     action: str = "chat"
+    plan: Optional[PlanBlock] = None
+    changes: Optional[list[FileChange]] = None

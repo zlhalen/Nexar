@@ -8,7 +8,7 @@ import CodeEditor from './components/CodeEditor';
 import ChatPanel from './components/ChatPanel';
 import DiffView from './components/DiffView';
 import { api } from './api';
-import type { FileItem, ChatMessage, AIResponse, Provider, CodeSnippet } from './api';
+import type { FileItem, ChatMessage, AIResponse, Provider, CodeSnippet, PlanBlock, FileChange } from './api';
 
 interface OpenFile {
   path: string;
@@ -20,6 +20,7 @@ interface OpenFile {
 interface SendOptions {
   snippets?: CodeSnippet[];
   chatOnly?: boolean;
+  planningMode?: boolean;
 }
 
 interface ChatSession {
@@ -28,6 +29,8 @@ interface ChatSession {
   messages: ChatMessage[];
   lastAIResult: AIResponse | null;
   draftSnippets: CodeSnippet[];
+  activePlan: PlanBlock | null;
+  planRunning: boolean;
 }
 
 function createChatSession(index: number): ChatSession {
@@ -37,6 +40,8 @@ function createChatSession(index: number): ChatSession {
     messages: [],
     lastAIResult: null,
     draftSnippets: [],
+    activePlan: null,
+    planRunning: false,
   };
 }
 
@@ -303,7 +308,7 @@ export default function App() {
     if (!activeChatId) return;
     setChats(prev => prev.map(chat =>
       chat.id === activeChatId
-        ? { ...chat, messages: [], lastAIResult: null, draftSnippets: [] }
+        ? { ...chat, messages: [], lastAIResult: null, draftSnippets: [], activePlan: null, planRunning: false }
         : chat
     ));
   }, [activeChatId]);
@@ -338,6 +343,7 @@ export default function App() {
       content: text,
       snippets: options?.snippets && options.snippets.length > 0 ? options.snippets : undefined,
       chat_only: options?.chatOnly === true,
+      planning_mode: options?.planningMode === true,
     };
     const newMessages = [...targetChat.messages, userMsg];
     setChats(prev => prev.map(chat =>
@@ -362,6 +368,7 @@ export default function App() {
         current_code: currentFileObj?.content,
         snippets: options?.snippets,
         chat_only: options?.chatOnly === true,
+        planning_mode: options?.planningMode === true,
       });
 
       const assistantMsg: ChatMessage = { role: 'assistant', content: result.content };
@@ -372,11 +379,23 @@ export default function App() {
               messages: [...chat.messages, assistantMsg],
               lastAIResult: result,
               draftSnippets: [],
+              activePlan: result.action === 'plan' && result.plan
+                ? {
+                    ...result.plan,
+                    steps: result.plan.steps.map(step => ({
+                      ...step,
+                      status: step.status || 'pending',
+                      summary: '',
+                      error: '',
+                      changes: [],
+                    })),
+                  }
+                : chat.activePlan,
             }
           : chat
       ));
 
-      if (result.file_path && result.file_content) {
+      if (result.file_path && result.file_content && !options?.planningMode) {
         await loadFileTree();
         showStatus(`AI ${result.action === 'generate' ? '生成' : '修改'}了文件: ${result.file_path}`);
         
@@ -412,6 +431,141 @@ export default function App() {
       setAiLoading(false);
     }
   }, [activeChatId, chats, currentProvider, activeFile, openFiles, loadFileTree, showStatus]);
+
+  const executePlan = useCallback(async () => {
+    if (!activeChatId || aiLoading) return;
+    const targetChat = chats.find(c => c.id === activeChatId);
+    const plan = targetChat?.activePlan;
+    if (!plan || plan.steps.length === 0) return;
+
+    const normalizedPlan: PlanBlock = {
+      ...plan,
+      steps: plan.steps.map(step => ({
+        ...step,
+        status: step.status === 'in_progress' ? 'pending' : (step.status || 'pending'),
+      })),
+    };
+
+    let workingPlan = normalizedPlan;
+    const currentFileObj = openFiles.find(f => f.path === activeFile);
+
+    setChats(prev => prev.map(chat =>
+      chat.id === activeChatId
+        ? { ...chat, planRunning: true, activePlan: normalizedPlan, lastAIResult: null }
+        : chat
+    ));
+
+    try {
+      for (let i = 0; i < workingPlan.steps.length; i++) {
+        const step = workingPlan.steps[i];
+        if (step.status === 'completed') continue;
+
+        const inProgressPlan: PlanBlock = {
+          ...workingPlan,
+          steps: workingPlan.steps.map((s, idx) =>
+            idx === i ? { ...s, status: 'in_progress' } : s
+          ),
+        };
+        workingPlan = inProgressPlan;
+        setChats(prev => prev.map(chat =>
+          chat.id === activeChatId
+            ? { ...chat, activePlan: inProgressPlan }
+            : chat
+        ));
+
+        const execPrompt =
+          `按已确认计划执行第 ${i + 1} 步，仅执行这一步，不要提前执行后续步骤。\n` +
+          `目标：${workingPlan.summary}\n` +
+          `当前步骤：${step.title}\n` +
+          `步骤说明：${step.detail || '无'}\n` +
+          `验收标准：${step.acceptance || '无'}\n` +
+          `执行后仅返回简短完成说明。`;
+
+        const result = await api.chat({
+          provider: currentProvider,
+          messages: [
+            ...targetChat!.messages,
+            { role: 'user', content: execPrompt },
+          ],
+          current_file: activeFile || undefined,
+          current_code: currentFileObj?.content,
+          chat_only: false,
+          planning_mode: false,
+        });
+
+        if (result.file_path && result.file_content) {
+          await loadFileTree();
+        }
+
+        const stepChanges: FileChange[] = result.changes
+          ? result.changes
+          : (result.file_path && result.file_content
+            ? [{
+                file_path: result.file_path,
+                file_content: result.file_content,
+                before_content: '',
+                after_content: result.file_content,
+                diff_unified: '',
+                before_hash: '',
+                after_hash: '',
+                write_result: 'written',
+              }]
+            : []);
+
+        const hasWritten = stepChanges.some(change => change.write_result === 'written');
+        const hasFailed = stepChanges.some(change => change.write_result === 'failed');
+        const finalStatus = hasFailed ? (hasWritten ? 'partial' : 'failed') : 'completed';
+
+        const completedPlan: PlanBlock = {
+          ...workingPlan,
+          steps: workingPlan.steps.map((s, idx) =>
+            idx === i
+              ? {
+                  ...s,
+                  status: finalStatus,
+                  summary: result.content,
+                  error: hasFailed ? stepChanges.filter(c => c.error).map(c => c.error).join('; ') : '',
+                  changes: stepChanges,
+                }
+              : s
+          ),
+        };
+        workingPlan = completedPlan;
+        setChats(prev => prev.map(chat =>
+          chat.id === activeChatId
+            ? { ...chat, activePlan: completedPlan }
+            : chat
+        ));
+
+        if (!hasWritten) {
+          throw new Error(`步骤 ${i + 1} 执行失败，未产生可写入变更`);
+        }
+      }
+      showStatus('计划执行完成');
+    } catch (e: any) {
+      const failedIndex = workingPlan.steps.findIndex(step => step.status === 'in_progress');
+      const failedPlan: PlanBlock = failedIndex === -1
+        ? workingPlan
+        : {
+            ...workingPlan,
+            steps: workingPlan.steps.map((s, idx) =>
+              idx === failedIndex ? { ...s, status: 'failed' } : s
+            ),
+          };
+      setChats(prev => prev.map(chat =>
+        chat.id === activeChatId
+          ? { ...chat, activePlan: failedPlan }
+          : chat
+      ));
+      showStatus(`计划执行中断: ${e.message}`);
+    } finally {
+      setChats(prev => prev.map(chat =>
+        chat.id === activeChatId
+          ? { ...chat, planRunning: false }
+          : chat
+      ));
+    }
+  }, [activeChatId, aiLoading, chats, openFiles, activeFile, currentProvider, loadFileTree, showStatus]);
 
   const handleDiffApply = useCallback(async () => {
     if (!diffData) return;
@@ -528,9 +682,12 @@ export default function App() {
                 onClear={clearActiveChat}
                 activeFile={activeFile}
                 lastAIResult={activeChat?.lastAIResult || null}
+                activePlan={activeChat?.activePlan || null}
+                planRunning={activeChat?.planRunning || false}
                 onApplyFile={applyFile}
                 onShowDiff={showDiffView}
                 getCurrentFileContent={getCurrentFileContent}
+                onExecutePlan={executePlan}
               />
             </div>
           </>

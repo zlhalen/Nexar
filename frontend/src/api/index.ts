@@ -25,6 +25,7 @@ export interface ChatMessage {
   content: string;
   snippets?: CodeSnippet[];
   chat_only?: boolean;
+  planning_mode?: boolean;
 }
 
 export interface AIRequest {
@@ -37,6 +38,36 @@ export interface AIRequest {
   range_end?: number;
   snippets?: CodeSnippet[];
   chat_only?: boolean;
+  planning_mode?: boolean;
+}
+
+export interface PlanStep {
+  title: string;
+  detail?: string;
+  status: string;
+  acceptance?: string;
+  summary?: string;
+  error?: string;
+  changes?: FileChange[];
+}
+
+export interface PlanBlock {
+  summary: string;
+  milestones: string[];
+  steps: PlanStep[];
+  risks: string[];
+}
+
+export interface FileChange {
+  file_path: string;
+  file_content: string;
+  before_content?: string;
+  after_content?: string;
+  diff_unified?: string;
+  before_hash?: string;
+  after_hash?: string;
+  write_result: string;
+  error?: string;
 }
 
 export interface AIResponse {
@@ -44,6 +75,8 @@ export interface AIResponse {
   file_path?: string;
   file_content?: string;
   action: string;
+  plan?: PlanBlock;
+  changes?: FileChange[];
 }
 
 export interface Provider {
