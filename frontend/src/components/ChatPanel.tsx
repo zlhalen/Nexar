@@ -375,6 +375,13 @@ export default function ChatPanel({
                       {step.summary && (
                         <div className="text-xs text-[#b8d8ff] mt-1 whitespace-pre-wrap">{step.summary}</div>
                       )}
+                      {(step.backend_run_id || step.backend_step_status || step.backend_attempts) && (
+                        <div className="text-[10px] text-[#9fb8d6] mt-1 font-mono">
+                          {step.backend_run_id && `run:${step.backend_run_id.slice(0, 8)} `}
+                          {step.backend_step_status && `backend:${step.backend_step_status} `}
+                          {typeof step.backend_attempts === 'number' && `attempts:${step.backend_attempts}`}
+                        </div>
+                      )}
                       {step.error && (
                         <div className="text-xs text-red-300 mt-1">错误: {step.error}</div>
                       )}

@@ -37,6 +37,31 @@ class DeleteRequest(BaseModel):
     path: str
 
 
+class TerminalSessionCreateRequest(BaseModel):
+    cwd: str = ""
+    shell: str = "/bin/bash"
+
+
+class TerminalSessionInfo(BaseModel):
+    session_id: str
+    cwd: str
+    shell: str
+    alive: bool = True
+    exit_code: Optional[int] = None
+    output: str = ""
+
+
+class TerminalSessionInputRequest(BaseModel):
+    data: str
+
+
+class TerminalSessionOutputResponse(BaseModel):
+    session_id: str
+    output: str = ""
+    alive: bool = True
+    exit_code: Optional[int] = None
+
+
 class ChatMessage(BaseModel):
     role: str  # "user" | "assistant"
     content: str
@@ -62,6 +87,36 @@ class FileChange(BaseModel):
     error: Optional[str] = None
 
 
+class StepRunInfo(BaseModel):
+    index: int
+    name: str
+    kind: str
+    goal: str
+    status: str = "pending"
+    attempts: int = 0
+    error: Optional[str] = None
+
+
+class PlanRunInfo(BaseModel):
+    run_id: str
+    intent: str
+    status: str = "running"
+    max_retries: int = 3
+    current_step_index: int = -1
+    steps: list[StepRunInfo] = Field(default_factory=list)
+    started_at: Optional[str] = None
+    finished_at: Optional[str] = None
+    result_action: Optional[str] = None
+    result_content: Optional[str] = None
+    result_file_path: Optional[str] = None
+    result_file_content: Optional[str] = None
+    result_changes: list[FileChange] = Field(default_factory=list)
+
+
+class StartRunResponse(BaseModel):
+    run_id: str
+
+
 class AIRequest(BaseModel):
     provider: AIProvider = AIProvider.OPENAI
     messages: list[ChatMessage]
@@ -73,6 +128,7 @@ class AIRequest(BaseModel):
     snippets: Optional[list[CodeSnippet]] = None
     chat_only: bool = False
     planning_mode: bool = False
+    force_code_edit: bool = False
 
 
 class PlanStep(BaseModel):
@@ -96,3 +152,4 @@ class AIResponse(BaseModel):
     action: str = "chat"
     plan: Optional[PlanBlock] = None
     changes: Optional[list[FileChange]] = None
+    run: Optional[PlanRunInfo] = None

@@ -29,14 +29,14 @@ In Nexar, there is no "black-box magic". Everything is transparent.
 
 ## 📦 Installation
 
-This is the v1.0 release. Install the core extension locally:
+This is the v1.0 Alpha release. Install the core extension locally:
 
 [Install](./install.md)
 
 ## 🗺 Roadmap & VIP Features
 
 <details>
-<summary><b>Click to expand our vision for V2.0+ and VIP features</b></summary>
+<summary><b>Click to expand our vision for V1.0+ and VIP features</b></summary>
 
 Currently, we are focusing on mastering the "White-Box Pipeline". In future/VIP releases, we plan to introduce:
 

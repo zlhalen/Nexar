@@ -1,14 +1,17 @@
 import React, { useState, useEffect, useCallback } from 'react';
 import {
   PanelLeftClose, PanelLeftOpen, PanelRightClose, PanelRightOpen,
-  Terminal, Bot,
+  Terminal, Bot, ChevronDown, ChevronUp,
 } from 'lucide-react';
 import FileTree from './components/FileTree';
 import CodeEditor from './components/CodeEditor';
 import ChatPanel from './components/ChatPanel';
 import DiffView from './components/DiffView';
+import TerminalPanel from './components/TerminalPanel';
 import { api } from './api';
-import type { FileItem, ChatMessage, AIResponse, Provider, CodeSnippet, PlanBlock, FileChange } from './api';
+import type {
+  FileItem, ChatMessage, AIResponse, Provider, CodeSnippet, PlanBlock, FileChange, PlanRunInfo,
+} from './api';
 
 interface OpenFile {
   path: string;
@@ -61,12 +64,18 @@ export default function App() {
   const [activeFile, setActiveFile] = useState<string | null>(null);
   const [showSidebar, setShowSidebar] = useState(true);
   const [showChat, setShowChat] = useState(true);
+  const [showTerminal, setShowTerminal] = useState(true);
+  const [terminalHeight, setTerminalHeight] = useState(256);
   const [sidebarWidth, setSidebarWidth] = useState(240);
   const [chatWidth, setChatWidth] = useState(380);
   const [resizing, setResizing] = useState<{
     panel: 'sidebar' | 'chat';
     startX: number;
     startWidth: number;
+  } | null>(null);
+  const [terminalResizing, setTerminalResizing] = useState<{
+    startY: number;
+    startHeight: number;
   } | null>(null);
   const [chats, setChats] = useState<ChatSession[]>(() => [createChatSession(1)]);
   const [activeChatId, setActiveChatId] = useState<string>('');
@@ -148,6 +157,31 @@ export default function App() {
       document.body.style.userSelect = '';
     };
   }, [resizing]);
+
+  useEffect(() => {
+    if (!terminalResizing) return;
+
+    const onMouseMove = (e: MouseEvent) => {
+      const delta = terminalResizing.startY - e.clientY;
+      const max = Math.max(220, Math.floor(window.innerHeight * 0.7));
+      const next = Math.min(max, Math.max(120, terminalResizing.startHeight + delta));
+      setTerminalHeight(next);
+    };
+
+    const onMouseUp = () => setTerminalResizing(null);
+
+    document.addEventListener('mousemove', onMouseMove);
+    document.addEventListener('mouseup', onMouseUp);
+    document.body.style.cursor = 'row-resize';
+    document.body.style.userSelect = 'none';
+
+    return () => {
+      document.removeEventListener('mousemove', onMouseMove);
+      document.removeEventListener('mouseup', onMouseUp);
+      document.body.style.cursor = '';
+      document.body.style.userSelect = '';
+    };
+  }, [terminalResizing]);
 
   const openFile = useCallback(async (path: string) => {
     const existing = openFiles.find(f => f.path === path);
@@ -456,6 +490,25 @@ export default function App() {
     ));
 
     try {
+      const sleep = (ms: number) => new Promise(resolve => setTimeout(resolve, ms));
+      const pollRun = async (runId: string, onTick?: (run: PlanRunInfo) => void): Promise<PlanRunInfo | null> => {
+        let latest: PlanRunInfo | null = null;
+        for (let k = 0; k < 240; k++) {
+          try {
+            latest = await api.getRun(runId);
+            if (latest && onTick) onTick(latest);
+            if (latest.status === 'completed' || latest.status === 'failed') {
+              return latest;
+            }
+          } catch {
+            // Best-effort polling; fallback to response.run if unavailable.
+            return latest;
+          }
+          await sleep(250);
+        }
+        return latest;
+      };
+
       for (let i = 0; i < workingPlan.steps.length; i++) {
         const step = workingPlan.steps[i];
         if (step.status === 'completed') continue;
@@ -481,7 +534,7 @@ export default function App() {
           `验收标准：${step.acceptance || '无'}\n` +
           `执行后仅返回简短完成说明。`;
 
-        const result = await api.chat({
+        const runStart = await api.startRun({
           provider: currentProvider,
           messages: [
             ...targetChat!.messages,
@@ -491,20 +544,44 @@ export default function App() {
           current_code: currentFileObj?.content,
           chat_only: false,
           planning_mode: false,
+          force_code_edit: true,
         });
+        const runInfo = await pollRun(runStart.run_id, (tick) => {
+          const tickStep = tick.steps?.[tick.current_step_index >= 0 ? tick.current_step_index : Math.max(0, tick.steps.length - 1)];
+          setChats(prev => prev.map(chat => {
+            if (chat.id !== activeChatId || !chat.activePlan) return chat;
+            const steps = chat.activePlan.steps.map((s, idx) =>
+              idx === i
+                ? {
+                    ...s,
+                    status: tickStep?.status || s.status,
+                    backend_run_id: tick.run_id,
+                    backend_step_status: tickStep?.status || '',
+                    backend_attempts: tickStep?.attempts ?? s.backend_attempts ?? 0,
+                    error: tickStep?.error || s.error,
+                  }
+                : s
+            );
+            return { ...chat, activePlan: { ...chat.activePlan, steps } };
+          }));
+        });
+        if (!runInfo) {
+          throw new Error(`run ${runStart.run_id} 轮询失败`);
+        }
+        const backendStep = runInfo.steps?.[runInfo.current_step_index >= 0 ? runInfo.current_step_index : Math.max(0, runInfo.steps.length - 1)];
 
-        if (result.file_path && result.file_content) {
+        if (runInfo.result_file_path && runInfo.result_file_content) {
           await loadFileTree();
         }
 
-        const stepChanges: FileChange[] = result.changes
-          ? result.changes
-          : (result.file_path && result.file_content
+        const stepChanges: FileChange[] = runInfo.result_changes && runInfo.result_changes.length > 0
+          ? runInfo.result_changes
+          : (runInfo.result_file_path && runInfo.result_file_content
             ? [{
-                file_path: result.file_path,
-                file_content: result.file_content,
+                file_path: runInfo.result_file_path,
+                file_content: runInfo.result_file_content,
                 before_content: '',
-                after_content: result.file_content,
+                after_content: runInfo.result_file_content,
                 diff_unified: '',
                 before_hash: '',
                 after_hash: '',
@@ -514,7 +591,8 @@ export default function App() {
 
         const hasWritten = stepChanges.some(change => change.write_result === 'written');
         const hasFailed = stepChanges.some(change => change.write_result === 'failed');
-        const finalStatus = hasFailed ? (hasWritten ? 'partial' : 'failed') : 'completed';
+        const localStatus = hasFailed ? (hasWritten ? 'partial' : 'failed') : 'completed';
+        const finalStatus = backendStep?.status || localStatus;
 
         const completedPlan: PlanBlock = {
           ...workingPlan,
@@ -523,9 +601,12 @@ export default function App() {
               ? {
                   ...s,
                   status: finalStatus,
-                  summary: result.content,
-                  error: hasFailed ? stepChanges.filter(c => c.error).map(c => c.error).join('; ') : '',
+                  summary: runInfo.result_content || '',
+                  error: backendStep?.error || (hasFailed ? stepChanges.filter(c => c.error).map(c => c.error).join('; ') : ''),
                   changes: stepChanges,
+                  backend_run_id: runInfo?.run_id || '',
+                  backend_step_status: backendStep?.status || '',
+                  backend_attempts: backendStep?.attempts ?? 0,
                 }
               : s
           ),
@@ -591,6 +672,13 @@ export default function App() {
         </div>
         <div className="flex items-center gap-1">
           <button
+            onClick={() => setShowTerminal(!showTerminal)}
+            className="p-1.5 hover:bg-hover-bg rounded"
+            title={showTerminal ? '隐藏控制台' : '显示控制台'}
+          >
+            {showTerminal ? <ChevronDown size={16} /> : <ChevronUp size={16} />}
+          </button>
+          <button
             onClick={() => setShowSidebar(!showSidebar)}
             className="p-1.5 hover:bg-hover-bg rounded"
             title={showSidebar ? '隐藏侧栏' : '显示侧栏'}
@@ -608,89 +696,105 @@ export default function App() {
       </div>
 
       {/* Main Area */}
-      <div className="flex flex-1 overflow-hidden">
-        {/* Sidebar */}
-        {showSidebar && (
-          <div style={{ width: sidebarWidth }} className="flex-shrink-0 border-r border-border-color overflow-hidden">
-            <FileTree
-              files={files}
-              activeFile={activeFile}
-              onFileSelect={openFile}
-              onRefresh={loadFileTree}
-              onCreate={createItem}
-              onDelete={deleteItem}
-              onRename={renameItem}
+      <div className="flex flex-1 flex-col overflow-hidden">
+        <div className="flex flex-1 overflow-hidden">
+          {/* Sidebar */}
+          {showSidebar && (
+            <div style={{ width: sidebarWidth }} className="flex-shrink-0 border-r border-border-color overflow-hidden">
+              <FileTree
+                files={files}
+                activeFile={activeFile}
+                onFileSelect={openFile}
+                onRefresh={loadFileTree}
+                onCreate={createItem}
+                onDelete={deleteItem}
+                onRename={renameItem}
+              />
+            </div>
+          )}
+          {showSidebar && (
+            <div
+              className="w-1 flex-shrink-0 cursor-col-resize bg-transparent hover:bg-accent/30 active:bg-accent/40"
+              onMouseDown={e => setResizing({ panel: 'sidebar', startX: e.clientX, startWidth: sidebarWidth })}
+              title="拖动调整目录树宽度"
             />
-          </div>
-        )}
-        {showSidebar && (
-          <div
-            className="w-1 flex-shrink-0 cursor-col-resize bg-transparent hover:bg-accent/30 active:bg-accent/40"
-            onMouseDown={e => setResizing({ panel: 'sidebar', startX: e.clientX, startWidth: sidebarWidth })}
-            title="拖动调整目录树宽度"
-          />
-        )}
+          )}
 
-        {/* Editor or Diff View */}
-        <div className="flex-1 overflow-hidden">
-          {showDiff && diffData ? (
-            <DiffView
-              filePath={diffData.path}
-              oldContent={diffData.oldContent}
-              newContent={diffData.newContent}
-              language={diffData.language}
-              onApply={handleDiffApply}
-              onCancel={handleDiffCancel}
-            />
-          ) : (
-            <CodeEditor
-              openFiles={openFiles}
-              activeFile={activeFile}
-              onTabSelect={setActiveFile}
-              onTabClose={closeFile}
-              onContentChange={updateContent}
-              onSave={saveFile}
-              onAddSnippetToCurrentChat={addSnippetToCurrentChat}
-              onAddSnippetToNewChat={addSnippetToNewChat}
-            />
+          {/* Editor or Diff View */}
+          <div className="flex-1 overflow-hidden">
+            {showDiff && diffData ? (
+              <DiffView
+                filePath={diffData.path}
+                oldContent={diffData.oldContent}
+                newContent={diffData.newContent}
+                language={diffData.language}
+                onApply={handleDiffApply}
+                onCancel={handleDiffCancel}
+              />
+            ) : (
+              <CodeEditor
+                openFiles={openFiles}
+                activeFile={activeFile}
+                onTabSelect={setActiveFile}
+                onTabClose={closeFile}
+                onContentChange={updateContent}
+                onSave={saveFile}
+                onAddSnippetToCurrentChat={addSnippetToCurrentChat}
+                onAddSnippetToNewChat={addSnippetToNewChat}
+              />
+            )}
+          </div>
+
+          {/* Chat Panel */}
+          {showChat && (
+            <>
+              <div
+                className="w-1 flex-shrink-0 cursor-col-resize bg-transparent hover:bg-accent/30 active:bg-accent/40"
+                onMouseDown={e => setResizing({ panel: 'chat', startX: e.clientX, startWidth: chatWidth })}
+                title="拖动调整聊天面板宽度"
+              />
+              <div style={{ width: chatWidth }} className="flex-shrink-0 border-l border-border-color overflow-hidden">
+                <ChatPanel
+                  chatTabs={chats.map(c => ({ id: c.id, title: c.title }))}
+                  activeChatId={activeChatId}
+                  onChatSelect={setActiveChatId}
+                  onChatCreate={createChatTab}
+                  onChatClose={closeChatTab}
+                  draftSnippets={activeChat?.draftSnippets || []}
+                  onDraftSnippetsChange={setActiveChatDraftSnippets}
+                  messages={activeChat?.messages || []}
+                  loading={aiLoading}
+                  providers={providers}
+                  currentProvider={currentProvider}
+                  onProviderChange={setCurrentProvider}
+                  onSend={sendMessage}
+                  onClear={clearActiveChat}
+                  activeFile={activeFile}
+                  lastAIResult={activeChat?.lastAIResult || null}
+                  activePlan={activeChat?.activePlan || null}
+                  planRunning={activeChat?.planRunning || false}
+                  onApplyFile={applyFile}
+                  onShowDiff={showDiffView}
+                  getCurrentFileContent={getCurrentFileContent}
+                  onExecutePlan={executePlan}
+                />
+              </div>
+            </>
           )}
         </div>
 
-        {/* Chat Panel */}
-        {showChat && (
-          <>
-            <div
-              className="w-1 flex-shrink-0 cursor-col-resize bg-transparent hover:bg-accent/30 active:bg-accent/40"
-              onMouseDown={e => setResizing({ panel: 'chat', startX: e.clientX, startWidth: chatWidth })}
-              title="拖动调整聊天面板宽度"
-            />
-            <div style={{ width: chatWidth }} className="flex-shrink-0 border-l border-border-color overflow-hidden">
-              <ChatPanel
-                chatTabs={chats.map(c => ({ id: c.id, title: c.title }))}
-                activeChatId={activeChatId}
-                onChatSelect={setActiveChatId}
-                onChatCreate={createChatTab}
-                onChatClose={closeChatTab}
-                draftSnippets={activeChat?.draftSnippets || []}
-                onDraftSnippetsChange={setActiveChatDraftSnippets}
-                messages={activeChat?.messages || []}
-                loading={aiLoading}
-                providers={providers}
-                currentProvider={currentProvider}
-                onProviderChange={setCurrentProvider}
-                onSend={sendMessage}
-                onClear={clearActiveChat}
-                activeFile={activeFile}
-                lastAIResult={activeChat?.lastAIResult || null}
-                activePlan={activeChat?.activePlan || null}
-                planRunning={activeChat?.planRunning || false}
-                onApplyFile={applyFile}
-                onShowDiff={showDiffView}
-                getCurrentFileContent={getCurrentFileContent}
-                onExecutePlan={executePlan}
-              />
-            </div>
-          </>
+        {showTerminal && (
+          <div
+            className="h-1 cursor-row-resize bg-transparent hover:bg-accent/40 active:bg-accent/60"
+            onMouseDown={e => setTerminalResizing({ startY: e.clientY, startHeight: terminalHeight })}
+            title="拖动调整控制台高度"
+          />
+        )}
+
+        {showTerminal && (
+          <div style={{ height: terminalHeight }}>
+            <TerminalPanel onStatus={msg => showStatus(msg)} />
+          </div>
         )}
       </div>
 

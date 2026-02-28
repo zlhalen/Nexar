@@ -39,6 +39,7 @@ export interface AIRequest {
   snippets?: CodeSnippet[];
   chat_only?: boolean;
   planning_mode?: boolean;
+  force_code_edit?: boolean;
 }
 
 export interface PlanStep {
@@ -49,6 +50,9 @@ export interface PlanStep {
   summary?: string;
   error?: string;
   changes?: FileChange[];
+  backend_run_id?: string;
+  backend_step_status?: string;
+  backend_attempts?: number;
 }
 
 export interface PlanBlock {
@@ -77,12 +81,59 @@ export interface AIResponse {
   action: string;
   plan?: PlanBlock;
   changes?: FileChange[];
+  run?: PlanRunInfo;
+}
+
+export interface PlanRunStepInfo {
+  index: number;
+  name: string;
+  kind: string;
+  goal: string;
+  status: string;
+  attempts: number;
+  error?: string;
+}
+
+export interface PlanRunInfo {
+  run_id: string;
+  intent: string;
+  status: string;
+  max_retries: number;
+  current_step_index: number;
+  steps: PlanRunStepInfo[];
+  started_at?: string;
+  finished_at?: string;
+  result_action?: string;
+  result_content?: string;
+  result_file_path?: string;
+  result_file_content?: string;
+  result_changes?: FileChange[];
+}
+
+export interface StartRunResponse {
+  run_id: string;
 }
 
 export interface Provider {
   id: string;
   name: string;
   model: string;
+}
+
+export interface TerminalSessionInfo {
+  session_id: string;
+  cwd: string;
+  shell: string;
+  alive: boolean;
+  exit_code?: number | null;
+  output: string;
+}
+
+export interface TerminalSessionOutput {
+  session_id: string;
+  output: string;
+  alive: boolean;
+  exit_code?: number | null;
 }
 
 async function request<T>(url: string, options?: RequestInit): Promise<T> {
@@ -135,4 +186,30 @@ export const api = {
     }),
 
   getProviders: () => request<Provider[]>('/ai/providers'),
+  getRun: (runId: string) => request<PlanRunInfo>(`/ai/runs/${encodeURIComponent(runId)}`),
+  startRun: (req: AIRequest) =>
+    request<StartRunResponse>('/ai/runs/start', {
+      method: 'POST',
+      body: JSON.stringify(req),
+    }),
+
+  createTerminalSession: (payload?: { cwd?: string; shell?: string }) =>
+    request<TerminalSessionInfo>('/terminal/sessions', {
+      method: 'POST',
+      body: JSON.stringify(payload || {}),
+    }),
+
+  writeTerminalInput: (sessionId: string, data: string) =>
+    request<{ success: boolean }>(`/terminal/sessions/${encodeURIComponent(sessionId)}/input`, {
+      method: 'POST',
+      body: JSON.stringify({ data }),
+    }),
+
+  readTerminalOutput: (sessionId: string) =>
+    request<TerminalSessionOutput>(`/terminal/sessions/${encodeURIComponent(sessionId)}/output`),
+
+  closeTerminalSession: (sessionId: string) =>
+    request<{ success: boolean }>(`/terminal/sessions/${encodeURIComponent(sessionId)}`, {
+      method: 'DELETE',
+    }),
 };
