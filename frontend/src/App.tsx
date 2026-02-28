@@ -1,7 +1,7 @@
 import React, { useState, useEffect, useCallback } from 'react';
 import {
   PanelLeftClose, PanelLeftOpen, PanelRightClose, PanelRightOpen,
-  Terminal, Bot, ChevronDown, ChevronUp,
+  Terminal, Bot,
 } from 'lucide-react';
 import FileTree from './components/FileTree';
 import CodeEditor from './components/CodeEditor';
@@ -672,13 +672,6 @@ export default function App() {
         </div>
         <div className="flex items-center gap-1">
           <button
-            onClick={() => setShowTerminal(!showTerminal)}
-            className="p-1.5 hover:bg-hover-bg rounded"
-            title={showTerminal ? '隐藏控制台' : '显示控制台'}
-          >
-            {showTerminal ? <ChevronDown size={16} /> : <ChevronUp size={16} />}
-          </button>
-          <button
             onClick={() => setShowSidebar(!showSidebar)}
             className="p-1.5 hover:bg-hover-bg rounded"
             title={showSidebar ? '隐藏侧栏' : '显示侧栏'}
@@ -720,28 +713,44 @@ export default function App() {
             />
           )}
 
-          {/* Editor or Diff View */}
-          <div className="flex-1 overflow-hidden">
-            {showDiff && diffData ? (
-              <DiffView
-                filePath={diffData.path}
-                oldContent={diffData.oldContent}
-                newContent={diffData.newContent}
-                language={diffData.language}
-                onApply={handleDiffApply}
-                onCancel={handleDiffCancel}
+          {/* Editor Area */}
+          <div className="flex-1 overflow-hidden flex flex-col">
+            <div className="flex-1 overflow-hidden">
+              {showDiff && diffData ? (
+                <DiffView
+                  filePath={diffData.path}
+                  oldContent={diffData.oldContent}
+                  newContent={diffData.newContent}
+                  language={diffData.language}
+                  onApply={handleDiffApply}
+                  onCancel={handleDiffCancel}
+                />
+              ) : (
+                <CodeEditor
+                  openFiles={openFiles}
+                  activeFile={activeFile}
+                  onTabSelect={setActiveFile}
+                  onTabClose={closeFile}
+                  onContentChange={updateContent}
+                  onSave={saveFile}
+                  onAddSnippetToCurrentChat={addSnippetToCurrentChat}
+                  onAddSnippetToNewChat={addSnippetToNewChat}
+                />
+              )}
+            </div>
+
+            {showTerminal && (
+              <div
+                className="h-1 cursor-row-resize bg-transparent hover:bg-accent/40 active:bg-accent/60"
+                onMouseDown={e => setTerminalResizing({ startY: e.clientY, startHeight: terminalHeight })}
+                title="拖动调整控制台高度"
               />
-            ) : (
-              <CodeEditor
-                openFiles={openFiles}
-                activeFile={activeFile}
-                onTabSelect={setActiveFile}
-                onTabClose={closeFile}
-                onContentChange={updateContent}
-                onSave={saveFile}
-                onAddSnippetToCurrentChat={addSnippetToCurrentChat}
-                onAddSnippetToNewChat={addSnippetToNewChat}
-              />
+            )}
+
+            {showTerminal && (
+              <div style={{ height: terminalHeight }} className="border-t border-border-color">
+                <TerminalPanel onStatus={msg => showStatus(msg)} />
+              </div>
             )}
           </div>
 
@@ -783,31 +792,30 @@ export default function App() {
           )}
         </div>
 
-        {showTerminal && (
-          <div
-            className="h-1 cursor-row-resize bg-transparent hover:bg-accent/40 active:bg-accent/60"
-            onMouseDown={e => setTerminalResizing({ startY: e.clientY, startHeight: terminalHeight })}
-            title="拖动调整控制台高度"
-          />
-        )}
-
-        {showTerminal && (
-          <div style={{ height: terminalHeight }}>
-            <TerminalPanel onStatus={msg => showStatus(msg)} />
-          </div>
-        )}
       </div>
 
       {/* Status Bar */}
-      <div className="flex items-center justify-between h-6 px-3 bg-accent text-white text-[11px] select-none">
-        <div className="flex items-center gap-3">
-          <span className="flex items-center gap-1">
+      <div className="flex items-center justify-between h-6 px-2 bg-[#0f1115] border-t border-border-color text-[#c6cbd3] text-[11px] select-none">
+        <div className="flex items-center gap-1.5">
+          <span className="flex items-center gap-1 px-1.5 py-0.5 rounded hover:bg-[#1a1f2a]">
             <Terminal size={11} />
             Nexar Code VIP
           </span>
+          <button
+            className={`flex items-center gap-1 px-1.5 py-0.5 rounded border ${
+              showTerminal
+                ? 'bg-[#1a2433] border-[#2c7be5]/40 text-[#7db3ff]'
+                : 'bg-transparent border-transparent hover:border-border-color hover:bg-[#1a1f2a]'
+            }`}
+            onClick={() => setShowTerminal(v => !v)}
+            title={showTerminal ? '隐藏控制台' : '显示控制台'}
+          >
+            <Terminal size={10} />
+            <span>Terminal</span>
+          </button>
           {activeFile && <span>{activeFile}</span>}
         </div>
-        <div className="flex items-center gap-3">
+        <div className="flex items-center gap-2.5">
           {statusMsg && <span className="animate-pulse">{statusMsg}</span>}
           <span>UTF-8</span>
           {activeFile && (

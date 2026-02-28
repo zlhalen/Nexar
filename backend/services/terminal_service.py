@@ -4,6 +4,9 @@ import select
 import signal
 import subprocess
 import uuid
+import fcntl
+import termios
+import struct
 from dataclasses import dataclass
 from threading import Lock
 from typing import Optional
@@ -75,6 +78,13 @@ class TerminalSessionManager:
         if session.process.poll() is not None:
             return
         os.write(session.master_fd, data.encode("utf-8", errors="replace"))
+
+    def resize_session(self, session_id: str, cols: int, rows: int) -> None:
+        session = self.get_session(session_id)
+        if cols < 1 or rows < 1:
+            return
+        winsize = struct.pack("HHHH", rows, cols, 0, 0)
+        fcntl.ioctl(session.master_fd, termios.TIOCSWINSZ, winsize)
 
     def read_output(self, session_id: str) -> tuple[str, bool, Optional[int]]:
         session = self.get_session(session_id)

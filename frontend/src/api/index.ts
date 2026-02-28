@@ -136,6 +136,11 @@ export interface TerminalSessionOutput {
   exit_code?: number | null;
 }
 
+export interface TerminalSessionResizeRequest {
+  cols: number;
+  rows: number;
+}
+
 async function request<T>(url: string, options?: RequestInit): Promise<T> {
   const resp = await fetch(`${BASE}${url}`, {
     headers: { 'Content-Type': 'application/json' },
@@ -207,6 +212,12 @@ export const api = {
 
   readTerminalOutput: (sessionId: string) =>
     request<TerminalSessionOutput>(`/terminal/sessions/${encodeURIComponent(sessionId)}/output`),
+
+  resizeTerminalSession: (sessionId: string, payload: TerminalSessionResizeRequest) =>
+    request<{ success: boolean }>(`/terminal/sessions/${encodeURIComponent(sessionId)}/resize`, {
+      method: 'POST',
+      body: JSON.stringify(payload),
+    }),
 
   closeTerminalSession: (sessionId: string) =>
     request<{ success: boolean }>(`/terminal/sessions/${encodeURIComponent(sessionId)}`, {

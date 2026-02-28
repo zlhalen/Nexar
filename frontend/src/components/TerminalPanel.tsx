@@ -1,5 +1,7 @@
 import React, { useEffect, useMemo, useRef, useState } from 'react';
-import { Loader2, Plus, Terminal, Trash2, X } from 'lucide-react';
+import { Loader2, Plus, Terminal as TerminalIcon, Trash2, X } from 'lucide-react';
+import { Terminal } from '@xterm/xterm';
+import { FitAddon } from '@xterm/addon-fit';
 import { api } from '../api';
 
 interface TerminalTab {
@@ -7,8 +9,6 @@ interface TerminalTab {
   title: string;
   sessionId: string | null;
   output: string;
-  input: string;
-  promptDir: string;
   alive: boolean;
   connecting: boolean;
   reading: boolean;
@@ -24,40 +24,22 @@ function createTerminalTab(index: number): TerminalTab {
     title: `终端 ${index}`,
     sessionId: null,
     output: '',
-    input: '',
-    promptDir: 'workspace',
     alive: false,
     connecting: true,
     reading: false,
   };
 }
 
-function stripAnsi(input: string): string {
-  return input
-    .replace(/\x1b\[[0-9;?]*[A-Za-z]/g, '')
-    .replace(/\u0007/g, '');
-}
-
-function getBaseName(path: string): string {
-  const normalized = path.replace(/\/+$/, '');
-  const parts = normalized.split('/').filter(Boolean);
-  return parts[parts.length - 1] || 'workspace';
-}
-
-function detectPromptDirFromText(text: string): string | null {
-  const trimmed = text.replace(/\r/g, '');
-  const match = trimmed.match(/(?:^|\n)([^\s/\n]+)\s\$\s?$/);
-  return match ? match[1] : null;
-}
-
 export default function TerminalPanel({ onStatus }: Props) {
   const [tabs, setTabs] = useState<TerminalTab[]>(() => [createTerminalTab(1)]);
   const [activeTabId, setActiveTabId] = useState('');
-  const outputRef = useRef<HTMLDivElement>(null);
-  const inputHostRef = useRef<HTMLDivElement>(null);
+  const termHostRef = useRef<HTMLDivElement>(null);
+  const termRef = useRef<Terminal | null>(null);
+  const fitRef = useRef<FitAddon | null>(null);
   const pollingRef = useRef<number | null>(null);
   const creatingRef = useRef<Set<string>>(new Set());
   const tabsRef = useRef<TerminalTab[]>(tabs);
+  const activeTabIdRef = useRef(activeTabId);
   const activeTab = useMemo(() => tabs.find(t => t.id === activeTabId) || tabs[0], [tabs, activeTabId]);
 
   useEffect(() => {
@@ -65,48 +47,104 @@ export default function TerminalPanel({ onStatus }: Props) {
   }, [tabs]);
 
   useEffect(() => {
-    if (!activeTabId && tabs.length > 0) setActiveTabId(tabs[0].id);
-  }, [activeTabId, tabs]);
-
-  useEffect(() => {
-    inputHostRef.current?.focus();
+    activeTabIdRef.current = activeTabId;
   }, [activeTabId]);
-
-  useEffect(() => {
-    if (outputRef.current) {
-      outputRef.current.scrollTop = outputRef.current.scrollHeight;
-    }
-  }, [activeTab?.output, activeTab?.input]);
 
   const updateTab = (tabId: string, updater: (tab: TerminalTab) => TerminalTab) => {
     setTabs(prev => prev.map(tab => (tab.id === tabId ? updater(tab) : tab)));
   };
 
+  const syncActiveSize = async () => {
+    const fit = fitRef.current;
+    const term = termRef.current;
+    const current = tabsRef.current.find(t => t.id === activeTabIdRef.current);
+    if (!fit || !term || !current?.sessionId) return;
+    fit.fit();
+    if (term.cols > 0 && term.rows > 0) {
+      try {
+        await api.resizeTerminalSession(current.sessionId, { cols: term.cols, rows: term.rows });
+      } catch {
+        // Keep terminal usable even if resize RPC fails intermittently.
+      }
+    }
+  };
+
+  useEffect(() => {
+    if (!termHostRef.current || termRef.current) return;
+
+    const term = new Terminal({
+      cursorBlink: true,
+      fontFamily: 'Menlo, Monaco, Consolas, "Courier New", monospace',
+      fontSize: 13,
+      lineHeight: 1.3,
+      theme: {
+        background: '#1e1e1e',
+        foreground: '#cccccc',
+      },
+      allowProposedApi: false,
+      convertEol: false,
+      scrollback: 5000,
+    });
+    const fitAddon = new FitAddon();
+    term.loadAddon(fitAddon);
+    term.open(termHostRef.current);
+    fitAddon.fit();
+    term.focus();
+
+    const disposable = term.onData((data: string) => {
+      const current = tabsRef.current.find(t => t.id === activeTabIdRef.current);
+      if (!current?.sessionId || !current.alive) return;
+      void api.writeTerminalInput(current.sessionId, data);
+    });
+
+    const observer = new ResizeObserver(() => {
+      void syncActiveSize();
+    });
+    observer.observe(termHostRef.current);
+
+    termRef.current = term;
+    fitRef.current = fitAddon;
+
+    return () => {
+      observer.disconnect();
+      disposable.dispose();
+      term.dispose();
+      termRef.current = null;
+      fitRef.current = null;
+    };
+  }, []);
+
   const createSession = async (tabId: string) => {
     updateTab(tabId, tab => ({ ...tab, connecting: true }));
     try {
       const session = await api.createTerminalSession({});
-      const cleanOutput = stripAnsi(session.output || '');
-      const promptDir = detectPromptDirFromText(cleanOutput) || getBaseName(session.cwd);
       updateTab(tabId, tab => ({
         ...tab,
         sessionId: session.session_id,
         connecting: false,
         alive: session.alive,
-        output: cleanOutput,
-        promptDir,
+        output: session.output || '',
       }));
+      if (tabId === activeTabIdRef.current && termRef.current) {
+        termRef.current.reset();
+        termRef.current.write(session.output || '');
+      }
+      await syncActiveSize();
       onStatus?.('终端会话已建立');
     } catch (e: any) {
       updateTab(tabId, tab => ({
         ...tab,
         connecting: false,
         alive: false,
-        output: `${tab.output}\n[error] ${e.message}\n`,
+        output: `${tab.output}\r\n[error] ${e.message}\r\n`,
       }));
       onStatus?.(`终端会话创建失败: ${e.message}`);
     }
   };
+
+  useEffect(() => {
+    if (!activeTabId && tabs.length > 0) setActiveTabId(tabs[0].id);
+  }, [activeTabId, tabs]);
 
   useEffect(() => {
     tabs.forEach(tab => {
@@ -120,6 +158,15 @@ export default function TerminalPanel({ onStatus }: Props) {
   }, [tabs]);
 
   useEffect(() => {
+    const term = termRef.current;
+    if (!term || !activeTab) return;
+    term.reset();
+    term.write(activeTab.output || '');
+    term.focus();
+    void syncActiveSize();
+  }, [activeTabId]);
+
+  useEffect(() => {
     if (pollingRef.current) window.clearInterval(pollingRef.current);
     pollingRef.current = window.setInterval(() => {
       tabsRef.current.forEach(tab => {
@@ -127,24 +174,22 @@ export default function TerminalPanel({ onStatus }: Props) {
         updateTab(tab.id, t => ({ ...t, reading: true }));
         api.readTerminalOutput(tab.sessionId)
           .then(res => {
-            const chunk = stripAnsi(res.output || '');
-            updateTab(tab.id, t => {
-              const nextOutput = chunk ? `${t.output}${chunk}` : t.output;
-              const promptDir = detectPromptDirFromText(nextOutput) || t.promptDir;
-              return {
-                ...t,
-                reading: false,
-                alive: res.alive,
-                output: nextOutput,
-                promptDir,
-              };
-            });
+            const chunk = res.output || '';
+            updateTab(tab.id, t => ({
+              ...t,
+              reading: false,
+              alive: res.alive,
+              output: chunk ? `${t.output}${chunk}` : t.output,
+            }));
+            if (chunk && tab.id === activeTabIdRef.current && termRef.current) {
+              termRef.current.write(chunk);
+            }
           })
           .catch(() => {
             updateTab(tab.id, t => ({ ...t, reading: false, alive: false }));
           });
       });
-    }, 200);
+    }, 120);
     return () => {
       if (pollingRef.current) window.clearInterval(pollingRef.current);
     };
@@ -177,63 +222,12 @@ export default function TerminalPanel({ onStatus }: Props) {
     });
   };
 
-  const sendInput = async (text: string) => {
-    if (!activeTab?.sessionId || !activeTab.alive) return;
-    try {
-      await api.writeTerminalInput(activeTab.sessionId, text);
-    } catch (e: any) {
-      updateTab(activeTab.id, tab => ({ ...tab, output: `${tab.output}\n[error] ${e.message}\n` }));
-      onStatus?.(`终端输入失败: ${e.message}`);
-    }
-  };
-
-  const handleKeyDown = (e: React.KeyboardEvent<HTMLDivElement>) => {
-    if (!activeTab || !activeTab.alive) return;
-
-    if (e.ctrlKey && (e.key === 'c' || e.key === 'C')) {
-      e.preventDefault();
-      if (activeTab.input.length > 0) {
-        updateTab(activeTab.id, tab => ({ ...tab, input: '' }));
-      } else {
-        void sendInput('\u0003');
-      }
-      return;
-    }
-
-    if (e.ctrlKey && (e.key === 'l' || e.key === 'L')) {
-      e.preventDefault();
-      updateTab(activeTab.id, tab => ({ ...tab, output: '' }));
-      void sendInput('\u000c');
-      return;
-    }
-
-    if (e.key === 'Enter') {
-      e.preventDefault();
-      const line = activeTab.input;
-      if (!line.trim()) {
-        void sendInput('\n');
-        return;
-      }
-      updateTab(activeTab.id, tab => ({ ...tab, input: '' }));
-      void sendInput(`${line}\n`);
-      return;
-    }
-
-    if (e.key === 'Backspace') {
-      e.preventDefault();
-      updateTab(activeTab.id, tab => ({ ...tab, input: tab.input.slice(0, -1) }));
-      return;
-    }
-
-    if (e.key === 'Tab') {
-      e.preventDefault();
-      updateTab(activeTab.id, tab => ({ ...tab, input: `${tab.input}  ` }));
-      return;
-    }
-
-    if (!e.ctrlKey && !e.metaKey && !e.altKey && e.key.length === 1) {
-      e.preventDefault();
-      updateTab(activeTab.id, tab => ({ ...tab, input: `${tab.input}${e.key}` }));
+  const clearActive = () => {
+    if (!activeTab) return;
+    updateTab(activeTab.id, tab => ({ ...tab, output: '' }));
+    if (termRef.current) {
+      termRef.current.reset();
+      termRef.current.focus();
     }
   };
 
@@ -244,20 +238,17 @@ export default function TerminalPanel({ onStatus }: Props) {
       ...tab,
       sessionId: null,
       output: '',
-      input: '',
       alive: false,
       connecting: true,
     }));
   };
-
-  if (!activeTab) return null;
 
   return (
     <div className="h-full flex flex-col bg-panel-bg border-t border-border-color">
       <div className="flex items-center justify-between px-2 py-1.5 border-b border-border-color bg-sidebar-bg">
         <div className="flex items-center gap-2 min-w-0 overflow-x-auto">
           <div className="flex items-center gap-1 text-xs text-text-primary px-2">
-            <Terminal size={13} className="text-accent" />
+            <TerminalIcon size={13} className="text-accent" />
             <span>控制台</span>
           </div>
           {tabs.map(tab => (
@@ -294,7 +285,7 @@ export default function TerminalPanel({ onStatus }: Props) {
         <div className="flex items-center gap-1">
           <button
             className="p-1 rounded hover:bg-hover-bg text-text-secondary"
-            onClick={() => updateTab(activeTab.id, tab => ({ ...tab, output: '' }))}
+            onClick={clearActive}
             title="清空输出"
           >
             <Trash2 size={13} />
@@ -308,26 +299,7 @@ export default function TerminalPanel({ onStatus }: Props) {
           </button>
         </div>
       </div>
-
-      <div
-        ref={outputRef}
-        className="flex-1 overflow-auto px-3 py-2 font-mono text-xs leading-5 bg-editor-bg text-text-primary whitespace-pre-wrap break-words cursor-text"
-        onClick={() => inputHostRef.current?.focus()}
-      >
-        <pre className="whitespace-pre-wrap break-words">{activeTab.output || (activeTab.connecting ? '正在连接终端...\n' : '')}</pre>
-        <div className="flex items-center">
-          <span className="text-success">{activeTab.promptDir} $ </span>
-          <span>{activeTab.input}</span>
-          <span className="ml-[1px] inline-block h-4 w-[7px] bg-text-primary animate-pulse" />
-        </div>
-      </div>
-
-      <div
-        ref={inputHostRef}
-        tabIndex={0}
-        className="h-0 w-0 outline-none"
-        onKeyDown={handleKeyDown}
-      />
+      <div ref={termHostRef} className="flex-1 overflow-hidden bg-editor-bg" />
     </div>
   );
 }

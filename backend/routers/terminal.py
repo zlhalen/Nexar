@@ -4,6 +4,7 @@ from backend.models.schemas import (
     TerminalSessionCreateRequest,
     TerminalSessionInfo,
     TerminalSessionInputRequest,
+    TerminalSessionResizeRequest,
     TerminalSessionOutputResponse,
 )
 from backend.services.file_service import get_workspace_root, _safe_path
@@ -68,6 +69,19 @@ async def read_terminal_output(session_id: str):
         raise HTTPException(status_code=404, detail=str(e))
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Failed to read output: {str(e)}")
+
+
+@router.post("/sessions/{session_id}/resize")
+async def resize_terminal_session(session_id: str, req: TerminalSessionResizeRequest):
+    if req.cols < 1 or req.rows < 1:
+        raise HTTPException(status_code=400, detail="rows and cols must be >= 1")
+    try:
+        terminal_manager.resize_session(session_id, req.cols, req.rows)
+        return {"success": True}
+    except KeyError as e:
+        raise HTTPException(status_code=404, detail=str(e))
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to resize session: {str(e)}")
 
 
 @router.delete("/sessions/{session_id}")

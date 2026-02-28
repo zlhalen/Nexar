@@ -55,6 +55,11 @@ class TerminalSessionInputRequest(BaseModel):
     data: str
 
 
+class TerminalSessionResizeRequest(BaseModel):
+    cols: int
+    rows: int
+
+
 class TerminalSessionOutputResponse(BaseModel):
     session_id: str
     output: str = ""
