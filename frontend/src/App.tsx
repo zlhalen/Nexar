@@ -11,7 +11,7 @@ import TerminalPanel from './components/TerminalPanel';
 import SettingsPage from './components/SettingsPage';
 import { api } from './api';
 import type {
-  FileItem, ChatMessage, AIResponse, Provider, CodeSnippet, ExecutionEvent, ActionSpec,
+  FileItem, ChatMessage, AIResponse, Provider, CodeSnippet, ExecutionEvent, ActionSpec, HistoryConfig,
 } from './api';
 
 interface OpenFile {
@@ -36,6 +36,7 @@ interface ChatSession {
   runId?: string;
   needsUserTrigger: boolean;
   pendingActions: ActionSpec[];
+  runStatus?: string;
 }
 
 function createChatSession(index: number): ChatSession {
@@ -49,6 +50,7 @@ function createChatSession(index: number): ChatSession {
     runId: undefined,
     needsUserTrigger: false,
     pendingActions: [],
+    runStatus: undefined,
   };
 }
 
@@ -62,6 +64,42 @@ function mergeSnippets(prev: CodeSnippet[], incoming: CodeSnippet[]): CodeSnippe
   return merged;
 }
 
+function mergeExecutionEvents(prev: ExecutionEvent[], incoming: ExecutionEvent[]): ExecutionEvent[] {
+  if (!incoming || incoming.length === 0) return prev;
+  if (!prev || prev.length === 0) return incoming.slice();
+  const byId = new Map<string, ExecutionEvent>();
+  for (const evt of prev) byId.set(evt.event_id, evt);
+  for (const evt of incoming) byId.set(evt.event_id, evt);
+  const incomingHasRealEvents = incoming.some(
+    evt => !(evt.stage === 'planning' && evt.status === 'running' && !!(evt.data as any)?.temporary)
+  );
+  const merged = Array.from(byId.values()).filter(evt => (
+    !incomingHasRealEvents || !(evt.stage === 'planning' && evt.status === 'running' && !!(evt.data as any)?.temporary)
+  ));
+  return merged.sort((a, b) => {
+    const ta = a.timestamp ? Date.parse(a.timestamp) : 0;
+    const tb = b.timestamp ? Date.parse(b.timestamp) : 0;
+    if (ta !== tb) return ta - tb;
+    return a.event_id.localeCompare(b.event_id);
+  });
+}
+
+function getDefaultChatWidth(): number {
+  if (typeof window === 'undefined') return 380;
+  const sidebarDefaultWidth = 240;
+  const splitterWidth = 1;
+  const availableMainWidth = window.innerWidth - sidebarDefaultWidth - splitterWidth;
+  return Math.max(280, Math.floor(availableMainWidth / 2));
+}
+
+const HISTORY_CONFIG_STORAGE_KEY = 'nexar.history_config.v1';
+const DEFAULT_HISTORY_CONFIG: HistoryConfig = {
+  turns: 40,
+  max_chars_per_message: 4000,
+  summary_enabled: true,
+  summary_max_chars: 1200,
+};
+
 export default function App() {
   const [files, setFiles] = useState<FileItem[]>([]);
   const [openFiles, setOpenFiles] = useState<OpenFile[]>([]);
@@ -71,7 +109,7 @@ export default function App() {
   const [showTerminal, setShowTerminal] = useState(true);
   const [terminalHeight, setTerminalHeight] = useState(256);
   const [sidebarWidth, setSidebarWidth] = useState(240);
-  const [chatWidth, setChatWidth] = useState(380);
+  const [chatWidth, setChatWidth] = useState(() => getDefaultChatWidth());
   const [resizing, setResizing] = useState<{
     panel: 'sidebar' | 'chat';
     startX: number;
@@ -84,8 +122,10 @@ export default function App() {
   const [chats, setChats] = useState<ChatSession[]>(() => [createChatSession(1)]);
   const [activeChatId, setActiveChatId] = useState<string>('');
   const [aiLoading, setAiLoading] = useState(false);
+  const [runControlLoading, setRunControlLoading] = useState(false);
   const [providers, setProviders] = useState<Provider[]>([]);
   const [currentProvider, setCurrentProvider] = useState('openai');
+  const [historyConfig, setHistoryConfig] = useState<HistoryConfig>(DEFAULT_HISTORY_CONFIG);
   const [statusMsg, setStatusMsg] = useState('');
   const [showDiff, setShowDiff] = useState(false);
   const [showSettingsPage, setShowSettingsPage] = useState(false);
@@ -98,6 +138,7 @@ export default function App() {
   const openFilesRef = useRef<OpenFile[]>([]);
   const autoSaveTimersRef = useRef<Record<string, number>>({});
   const runPollersRef = useRef<Record<string, boolean>>({});
+  const runDriversRef = useRef<Record<string, boolean>>({});
 
   const showStatus = useCallback((msg: string, duration = 3000) => {
     setStatusMsg(msg);
@@ -129,6 +170,36 @@ export default function App() {
   }, [loadFileTree, loadProviders]);
 
   useEffect(() => {
+    try {
+      const raw = localStorage.getItem(HISTORY_CONFIG_STORAGE_KEY);
+      if (!raw) return;
+      const parsed = JSON.parse(raw);
+      if (
+        parsed &&
+        typeof parsed.turns === 'number' &&
+        typeof parsed.max_chars_per_message === 'number' &&
+        typeof parsed.summary_enabled === 'boolean' &&
+        typeof parsed.summary_max_chars === 'number'
+      ) {
+        setHistoryConfig({
+          turns: parsed.turns,
+          max_chars_per_message: parsed.max_chars_per_message,
+          summary_enabled: parsed.summary_enabled,
+          summary_max_chars: parsed.summary_max_chars,
+        });
+      }
+    } catch {
+      // ignore broken local settings
+    }
+  }, []);
+
+  const updateHistoryConfig = useCallback((cfg: HistoryConfig) => {
+    setHistoryConfig(cfg);
+    localStorage.setItem(HISTORY_CONFIG_STORAGE_KEY, JSON.stringify(cfg));
+    showStatus('历史会话配置已保存');
+  }, [showStatus]);
+
+  useEffect(() => {
     openFilesRef.current = openFiles;
   }, [openFiles]);
 
@@ -139,6 +210,9 @@ export default function App() {
   useEffect(() => () => {
     Object.keys(runPollersRef.current).forEach(key => {
       runPollersRef.current[key] = false;
+    });
+    Object.keys(runDriversRef.current).forEach(key => {
+      runDriversRef.current[key] = false;
     });
   }, []);
 
@@ -414,7 +488,7 @@ export default function App() {
       chat.id === activeChatId
         ? {
           ...chat, messages: [], lastAIResult: null, executionEvents: [], draftSnippets: [],
-          runId: undefined, needsUserTrigger: false, pendingActions: [],
+          runId: undefined, needsUserTrigger: false, pendingActions: [], runStatus: undefined,
         }
         : chat
     ));
@@ -440,10 +514,115 @@ export default function App() {
     createChatTab([snippet]);
   }, [createChatTab]);
 
+  const syncRunIntoChat = useCallback((chatId: string, run: any) => {
+    setChats(prev => prev.map(chat =>
+      chat.id === chatId
+        ? {
+          ...chat,
+          executionEvents: mergeExecutionEvents(chat.executionEvents, run.events || []),
+          pendingActions: (run.latest_batch?.actions || []).filter((a: ActionSpec) => (run.pending_action_ids || []).includes(a.id)),
+          needsUserTrigger: (run.pending_action_ids || []).length > 0 && run.status === 'waiting_user',
+          runId: run.run_id || chat.runId,
+          runStatus: run.status || chat.runStatus,
+        }
+        : chat
+    ));
+  }, []);
+
+  const startAutoRun = useCallback(async (chatId: string, runId: string) => {
+    if (!runId || runDriversRef.current[runId]) return;
+    runDriversRef.current[runId] = true;
+    setAiLoading(true);
+    try {
+      while (runDriversRef.current[runId]) {
+        let runSnapshot: any;
+        try {
+          runSnapshot = await api.getRun(runId);
+          syncRunIntoChat(chatId, runSnapshot);
+        } catch {
+          break;
+        }
+
+        const status = runSnapshot.status;
+        const decisionMode = runSnapshot.latest_batch?.decision?.mode;
+        if (['completed', 'failed', 'blocked', 'cancelled', 'paused'].includes(status)) break;
+        if (status === 'waiting_user' && (decisionMode === 'ask_user' || decisionMode === 'blocked')) break;
+
+        const continuePromise = api.continueRun(runId);
+        let settled = false;
+        continuePromise.finally(() => { settled = true; });
+
+        runPollersRef.current[runId] = true;
+        while (runDriversRef.current[runId] && !settled) {
+          try {
+            const live = await api.getRun(runId);
+            syncRunIntoChat(chatId, live);
+          } catch {
+            // ignore transient polling errors
+          }
+          await new Promise(resolve => setTimeout(resolve, 450));
+        }
+        runPollersRef.current[runId] = false;
+        if (!runDriversRef.current[runId]) break;
+
+        let result: AIResponse;
+        try {
+          result = await continuePromise;
+        } catch (e: any) {
+          const errMsg: ChatMessage = { role: 'assistant', content: `❌ 错误: ${e.message}` };
+          setChats(prev => prev.map(chat =>
+            chat.id === chatId ? { ...chat, messages: [...chat.messages, errMsg] } : chat
+          ));
+          break;
+        }
+
+        const runStatus = result.run?.status;
+        const runMode = result.run?.latest_batch?.decision?.mode;
+        const hasFinalAnswerAction = (result.run?.latest_batch?.actions || []).some(a => a.type === 'final_answer');
+        const shouldAppendAssistant = !!result.content?.trim() && hasFinalAnswerAction;
+
+        setChats(prev => prev.map(chat =>
+          chat.id === chatId
+            ? {
+              ...chat,
+              messages: (() => {
+                if (!shouldAppendAssistant) return chat.messages;
+                const last = chat.messages[chat.messages.length - 1];
+                if (last?.role === 'assistant' && last.content === result.content) return chat.messages;
+                return [...chat.messages, { role: 'assistant', content: result.content }];
+              })(),
+              lastAIResult: result,
+              executionEvents: mergeExecutionEvents(chat.executionEvents, result.run?.events || []),
+              runId: result.run_id || result.run?.run_id || chat.runId,
+              needsUserTrigger: result.needs_user_trigger === true,
+              pendingActions: result.pending_actions || [],
+              runStatus: result.run?.status || chat.runStatus,
+            }
+            : chat
+        ));
+
+        if (result.file_path && result.file_content) {
+          await loadFileTree();
+        }
+
+        if (runStatus && ['completed', 'failed', 'blocked', 'cancelled', 'paused'].includes(runStatus)) break;
+        if (runStatus === 'waiting_user' && (runMode === 'ask_user' || runMode === 'blocked')) break;
+      }
+    } finally {
+      runPollersRef.current[runId] = false;
+      runDriversRef.current[runId] = false;
+      setAiLoading(false);
+    }
+  }, [loadFileTree, syncRunIntoChat]);
+
   const sendMessage = useCallback(async (text: string, options?: SendOptions) => {
     if (!activeChatId) return;
     const targetChat = chats.find(c => c.id === activeChatId);
     if (!targetChat) return;
+    if (targetChat.runId) {
+      runDriversRef.current[targetChat.runId] = false;
+      runPollersRef.current[targetChat.runId] = false;
+    }
 
     const userMsg: ChatMessage = {
       role: 'user',
@@ -458,14 +637,34 @@ export default function App() {
         : chat
     ));
     setAiLoading(true);
+    const creatingEvent: ExecutionEvent = {
+      event_id: `tmp-create-${Date.now()}`,
+      kind: 'planning',
+      stage: 'planning',
+      title: '规划下一步动作',
+      detail: '正在初始化执行上下文',
+      status: 'running',
+      timestamp: new Date().toISOString(),
+      iteration: 0,
+      data: { temporary: true },
+    };
     setChats(prev => prev.map(chat =>
       chat.id === activeChatId
-        ? { ...chat, lastAIResult: null, executionEvents: [] }
+        ? {
+          ...chat,
+          lastAIResult: null,
+          executionEvents: mergeExecutionEvents(chat.executionEvents, [creatingEvent]),
+          runId: undefined,
+          runStatus: 'running',
+          pendingActions: [],
+          needsUserTrigger: false,
+        }
         : chat
     ));
 
     const currentFileObj = openFiles.find(f => f.path === activeFile);
 
+    let launchedAutoRun = false;
     try {
       const result = await api.chat({
         provider: currentProvider,
@@ -474,20 +673,21 @@ export default function App() {
         current_code: currentFileObj?.content,
         snippets: options?.snippets,
         chat_only: options?.chatOnly === true,
+        history_config: historyConfig,
       });
 
-      const assistantMsg: ChatMessage = { role: 'assistant', content: result.content };
       setChats(prev => prev.map(chat =>
         chat.id === activeChatId
           ? {
               ...chat,
-              messages: [...chat.messages, assistantMsg],
+              messages: chat.messages,
               lastAIResult: result,
-              executionEvents: result.run?.events || chat.executionEvents,
+              executionEvents: mergeExecutionEvents(chat.executionEvents, result.run?.events || []),
               draftSnippets: [],
               runId: result.run_id || result.run?.run_id || chat.runId,
               needsUserTrigger: result.needs_user_trigger === true,
               pendingActions: result.pending_actions || [],
+              runStatus: result.run?.status || chat.runStatus,
             }
           : chat
       ));
@@ -517,6 +717,11 @@ export default function App() {
           }
         }
       }
+      const runId = result.run_id || result.run?.run_id;
+      if (runId) {
+        launchedAutoRun = true;
+        void startAutoRun(activeChatId, runId);
+      }
     } catch (e: any) {
       const errMsg: ChatMessage = { role: 'assistant', content: `❌ 错误: ${e.message}` };
       setChats(prev => prev.map(chat =>
@@ -525,69 +730,105 @@ export default function App() {
           : chat
       ));
     } finally {
-      setAiLoading(false);
+      if (!launchedAutoRun) setAiLoading(false);
     }
-  }, [activeChatId, chats, currentProvider, activeFile, openFiles, loadFileTree, showStatus]);
+  }, [activeChatId, chats, currentProvider, activeFile, openFiles, loadFileTree, showStatus, startAutoRun, historyConfig]);
 
-  const executeAllPendingActions = useCallback(async () => {
-    if (!activeChatId) return;
+  const pauseActiveRun = useCallback(async () => {
     const target = chats.find(c => c.id === activeChatId);
-    if (!target?.runId || aiLoading) return;
-    const chatId = activeChatId;
-    const runId = target.runId;
-    setAiLoading(true);
-    runPollersRef.current[runId] = true;
-    const pollRun = async () => {
-      while (runPollersRef.current[runId]) {
-        try {
-          const run = await api.getRun(runId);
-          setChats(prev => prev.map(chat =>
-            chat.id === chatId
-              ? {
-                ...chat,
-                executionEvents: run.events || chat.executionEvents,
-                pendingActions: (run.latest_batch?.actions || []).filter(a => (run.pending_action_ids || []).includes(a.id)),
-                needsUserTrigger: (run.pending_action_ids || []).length > 0 && run.status === 'waiting_user',
-                runId: run.run_id || chat.runId,
-              }
-              : chat
-          ));
-        } catch {
-          // Ignore transient polling errors.
-        }
-        await new Promise(resolve => setTimeout(resolve, 500));
-      }
-    };
-    void pollRun();
+    if (!target?.runId) {
+      showStatus('当前没有可暂停的任务');
+      return;
+    }
+    runDriversRef.current[target.runId] = false;
+    setRunControlLoading(true);
     try {
-      const result = await api.continueRun(runId);
-      const assistantMsg: ChatMessage = { role: 'assistant', content: result.content };
+      const run = await api.pauseRun(target.runId);
+      syncRunIntoChat(activeChatId, run);
+      showStatus('已暂停任务');
+    } catch (e: any) {
+      showStatus(`暂停失败: ${e.message}`);
+    } finally {
+      setRunControlLoading(false);
+    }
+  }, [activeChatId, chats, showStatus, syncRunIntoChat]);
+
+  const resumeActiveRun = useCallback(async () => {
+    const target = chats.find(c => c.id === activeChatId);
+    if (!target?.runId) {
+      showStatus('当前没有可继续的任务');
+      return;
+    }
+    setRunControlLoading(true);
+    try {
+      const run = await api.resumeRun(target.runId);
+      syncRunIntoChat(activeChatId, run);
+      void startAutoRun(activeChatId, target.runId);
+      showStatus('已继续任务');
+    } catch (e: any) {
+      showStatus(`恢复失败: ${e.message}`);
+    } finally {
+      setRunControlLoading(false);
+    }
+  }, [activeChatId, chats, showStatus, startAutoRun, syncRunIntoChat]);
+
+  const cancelActiveRun = useCallback(async () => {
+    const target = chats.find(c => c.id === activeChatId);
+    if (!target?.runId) {
+      showStatus('当前没有可取消的任务');
+      return;
+    }
+    runDriversRef.current[target.runId] = false;
+    setRunControlLoading(true);
+    try {
+      const run = await api.cancelRun(target.runId);
+      syncRunIntoChat(activeChatId, run);
+      showStatus('已取消任务');
+    } catch (e: any) {
+      showStatus(`取消失败: ${e.message}`);
+    } finally {
+      setRunControlLoading(false);
+    }
+  }, [activeChatId, chats, showStatus, syncRunIntoChat]);
+
+  const submitAskUserInput = useCallback(async (message: string) => {
+    const target = chats.find(c => c.id === activeChatId);
+    if (!target?.runId) {
+      showStatus('当前没有可继续的流程');
+      return;
+    }
+    const text = (message || '').trim();
+    if (!text) {
+      showStatus('请输入补充信息');
+      return;
+    }
+    setRunControlLoading(true);
+    try {
+      const result = await api.replyRun(target.runId, text);
       setChats(prev => prev.map(chat =>
-        chat.id === chatId
+        chat.id === activeChatId
           ? {
             ...chat,
-            messages: [...chat.messages, assistantMsg],
             lastAIResult: result,
-            executionEvents: result.run?.events || chat.executionEvents,
+            executionEvents: mergeExecutionEvents(chat.executionEvents, result.run?.events || []),
             runId: result.run_id || result.run?.run_id || chat.runId,
             needsUserTrigger: result.needs_user_trigger === true,
             pendingActions: result.pending_actions || [],
+            runStatus: result.run?.status || chat.runStatus,
           }
           : chat
       ));
-      if (result.file_path && result.file_content) {
-        await loadFileTree();
+      const runId = result.run_id || result.run?.run_id;
+      if (runId) {
+        void startAutoRun(activeChatId, runId);
       }
     } catch (e: any) {
-      const errMsg: ChatMessage = { role: 'assistant', content: `❌ 错误: ${e.message}` };
-      setChats(prev => prev.map(chat =>
-        chat.id === chatId ? { ...chat, messages: [...chat.messages, errMsg] } : chat
-      ));
+      showStatus(`提交补充信息失败: ${e.message}`);
+      throw e;
     } finally {
-      runPollersRef.current[runId] = false;
-      setAiLoading(false);
+      setRunControlLoading(false);
     }
-  }, [activeChatId, chats, aiLoading, loadFileTree]);
+  }, [activeChatId, chats, showStatus, startAutoRun]);
 
   const handleDiffApply = useCallback(async () => {
     if (!diffData) return;
@@ -725,9 +966,13 @@ export default function App() {
                   onApplyFile={applyFile}
                   onShowDiff={showDiffView}
                   getCurrentFileContent={getCurrentFileContent}
-                  canExecuteAll={(activeChat?.pendingActions?.length || 0) > 0}
                   pendingActions={activeChat?.pendingActions || []}
-                  onExecuteAll={executeAllPendingActions}
+                  runStatus={activeChat?.runStatus}
+                  controlDisabled={runControlLoading}
+                  onPauseRun={pauseActiveRun}
+                  onResumeRun={resumeActiveRun}
+                  onCancelRun={cancelActiveRun}
+                  onSubmitAskUserInput={submitAskUserInput}
                 />
               </div>
             </>
@@ -756,16 +1001,6 @@ export default function App() {
             <span>Terminal</span>
           </button>
           {activeFile && <span>{activeFile}</span>}
-          {activeChat?.pendingActions && activeChat.pendingActions.length > 0 && (
-            <button
-              className="ml-2 px-1.5 py-0.5 rounded border border-[#2f72d6]/50 text-[#9ec6ff] hover:bg-[#1a2433]"
-              onClick={executeAllPendingActions}
-              disabled={aiLoading}
-              title="执行当前轮全部子计划"
-            >
-              执行子计划 {activeChat.pendingActions.length}
-            </button>
-          )}
         </div>
         <div className="flex items-center gap-2.5">
           {statusMsg && <span className="animate-pulse">{statusMsg}</span>}
@@ -784,7 +1019,11 @@ export default function App() {
         </div>
       </div>
       {showSettingsPage && (
-        <SettingsPage onClose={() => setShowSettingsPage(false)} />
+        <SettingsPage
+          onClose={() => setShowSettingsPage(false)}
+          historyConfig={historyConfig}
+          onHistoryConfigChange={updateHistoryConfig}
+        />
       )}
     </div>
   );

@@ -25,7 +25,55 @@ LOG_DIR = os.path.join(os.path.dirname(__file__), "..", "..", "logs")
 os.makedirs(LOG_DIR, exist_ok=True)
 
 
-def _log_interaction(provider: str, model: str, messages: list[dict], response: str, elapsed_ms: int, error: str | None = None):
+def _estimate_tokens_from_messages(messages: list[dict]) -> int:
+    total_chars = 0
+    for msg in messages:
+        if not isinstance(msg, dict):
+            continue
+        total_chars += len(str(msg.get("content", "")))
+    return max(1, total_chars // 4)
+
+
+def _estimate_tokens_from_text(text: str) -> int:
+    return max(1, len(text) // 4)
+
+
+def _build_llm_call_meta(
+    *,
+    provider: str,
+    model: str,
+    messages: list[dict],
+    elapsed_ms: int,
+    input_tokens: int | None,
+    output_tokens: int | None,
+    token_source: str,
+) -> dict:
+    in_tokens = input_tokens if isinstance(input_tokens, int) and input_tokens >= 0 else _estimate_tokens_from_messages(messages)
+    out_tokens = output_tokens if isinstance(output_tokens, int) and output_tokens >= 0 else 0
+    return {
+        "provider": provider,
+        "model": model,
+        "elapsed_ms": elapsed_ms,
+        "prompt_messages": messages,
+        "tokens": {
+            "input": in_tokens,
+            "output": out_tokens,
+            "total": in_tokens + out_tokens,
+            "source": token_source,
+            "estimated": token_source != "provider",
+        },
+    }
+
+
+def _log_interaction(
+    provider: str,
+    model: str,
+    messages: list[dict],
+    response: str,
+    elapsed_ms: int,
+    error: str | None = None,
+    llm_call: dict | None = None,
+):
     """将每次 AI 请求和响应写入日志文件（按日期分文件）。"""
     today = datetime.now().strftime("%Y-%m-%d")
     log_file = os.path.join(LOG_DIR, f"ai_{today}.jsonl")
@@ -38,6 +86,7 @@ def _log_interaction(provider: str, model: str, messages: list[dict], response: 
         "prompt_messages": messages,
         "response": response if not error else None,
         "error": error,
+        "llm_call": llm_call,
     }
 
     try:
@@ -119,10 +168,13 @@ PLANNER_SYSTEM_PROMPT = """你是 Nexar 的动作规划器（Planner）。
 1) 不要写死固定流程，不要假设状态机；只决定“下一批 actions”。
 2) 输出必须是可执行、可验证的动作（每个 action 都要有 success_criteria）。
 3) 信息不足时输出 ask_user / request_approval，不要臆造文件内容。
-4) 当目标满足时，decision.mode=done，可包含 final_answer 动作。
+4) 当目标满足时，decision.mode=done，必须输出 final_answer 动作，并在 action.response.content 中给出最终答复文本。
 5) 只返回 JSON，不要 Markdown，不要解释文字。
 6) 发现/搜索类动作要遵守前置顺序：先 scan_workspace，再 search_code/read_files/analyze_dependencies（可用 depends_on 表达）。
 7) 对 create_file/update_file/apply_patch 动作：input 必须包含 path，且至少包含 content 或 instruction 之一。
+8) 对 final_answer 动作：response 必须包含 content（字符串）。
+9) 规划时优先结合 conversation_history 理解多轮上下文，不要只看 original_user_query。
+10) 如果提供了 conversation_summary，应先结合该摘要再阅读 conversation_history。
 
 输出格式：
 {
@@ -142,6 +194,7 @@ PLANNER_SYSTEM_PROMPT = """你是 Nexar 的动作规划器（Planner）。
       "title": "动作标题",
       "reason": "动作原因",
       "input": {},
+      "response": {},
       "depends_on": [],
       "can_parallel": false,
       "priority": 3,
@@ -401,7 +454,28 @@ def _parse_action_batch_response(raw: str, iteration: int) -> ActionBatch:
     return batch
 
 
-async def call_openai(messages: list[dict]) -> str:
+def _build_history_summary(messages: list[ChatMessage], max_chars: int) -> str:
+    if not messages:
+        return ""
+    parts: list[str] = []
+    total = 0
+    for msg in messages:
+        content = (msg.content or "").replace("\n", " ").strip()
+        if not content:
+            continue
+        entry = f"{msg.role}: {content}"
+        if total + len(entry) + (1 if parts else 0) > max_chars:
+            remain = max_chars - total - (1 if parts else 0)
+            if remain > 20:
+                entry = entry[:remain]
+                parts.append(entry)
+            break
+        parts.append(entry)
+        total += len(entry) + (1 if parts else 0)
+    return "\n".join(parts)
+
+
+async def call_openai(messages: list[dict]) -> tuple[str, dict]:
     import openai
     import time
     base_url = os.getenv("OPENAI_BASE_URL", "https://api.openai.com/v1")
@@ -431,8 +505,21 @@ async def call_openai(messages: list[dict]) -> str:
     try:
         resp = await client.chat.completions.create(model=model, messages=messages, temperature=0.3, max_tokens=8192)
         result = resp.choices[0].message.content or ""
-        _log_interaction("openai", model, messages, result, int((time.monotonic() - t0) * 1000))
-        return result
+        elapsed_ms = int((time.monotonic() - t0) * 1000)
+        usage = getattr(resp, "usage", None)
+        input_tokens = getattr(usage, "prompt_tokens", None) if usage is not None else None
+        output_tokens = getattr(usage, "completion_tokens", None) if usage is not None else None
+        llm_call = _build_llm_call_meta(
+            provider="openai",
+            model=model,
+            messages=messages,
+            elapsed_ms=elapsed_ms,
+            input_tokens=input_tokens,
+            output_tokens=output_tokens if isinstance(output_tokens, int) else _estimate_tokens_from_text(result),
+            token_source="provider" if isinstance(input_tokens, int) and isinstance(output_tokens, int) else "estimated",
+        )
+        _log_interaction("openai", model, messages, result, elapsed_ms, llm_call=llm_call)
+        return result, llm_call
     except openai.AuthenticationError as e:
         error_detail = str(e)
         # 尝试从异常对象中获取更多信息
@@ -498,7 +585,7 @@ async def call_openai(messages: list[dict]) -> str:
         raise ValueError(error_msg) from e
 
 
-async def call_claude(messages: list[dict]) -> str:
+async def call_claude(messages: list[dict]) -> tuple[str, dict]:
     import anthropic
     import time
     api_key = os.getenv("ANTHROPIC_API_KEY", "")
@@ -523,8 +610,21 @@ async def call_claude(messages: list[dict]) -> str:
             model=model, max_tokens=8192, system=system_msg, messages=api_messages, temperature=0.3
         )
         result = resp.content[0].text
-        _log_interaction("claude", model, messages, result, int((time.monotonic() - t0) * 1000))
-        return result
+        elapsed_ms = int((time.monotonic() - t0) * 1000)
+        usage = getattr(resp, "usage", None)
+        input_tokens = getattr(usage, "input_tokens", None) if usage is not None else None
+        output_tokens = getattr(usage, "output_tokens", None) if usage is not None else None
+        llm_call = _build_llm_call_meta(
+            provider="claude",
+            model=model,
+            messages=messages,
+            elapsed_ms=elapsed_ms,
+            input_tokens=input_tokens,
+            output_tokens=output_tokens if isinstance(output_tokens, int) else _estimate_tokens_from_text(result),
+            token_source="provider" if isinstance(input_tokens, int) and isinstance(output_tokens, int) else "estimated",
+        )
+        _log_interaction("claude", model, messages, result, elapsed_ms, llm_call=llm_call)
+        return result, llm_call
     except anthropic.AuthenticationError as e:
         error_msg = f"API 认证失败: API Key 无效或已过期。请检查 backend/.env 中的 ANTHROPIC_API_KEY 配置"
         _log_interaction("claude", model, messages, "", int((time.monotonic() - t0) * 1000), error=error_msg)
@@ -539,7 +639,7 @@ async def call_claude(messages: list[dict]) -> str:
         raise ValueError(error_msg) from e
 
 
-async def call_custom(messages: list[dict]) -> str:
+async def call_custom(messages: list[dict]) -> tuple[str, dict]:
     """OpenAI-compatible custom endpoint."""
     import httpx
     import time
@@ -567,8 +667,21 @@ async def call_custom(messages: list[dict]) -> str:
             resp.raise_for_status()
             data = resp.json()
             result = data["choices"][0]["message"]["content"]
-        _log_interaction("custom", model, messages, result, int((time.monotonic() - t0) * 1000))
-        return result
+        elapsed_ms = int((time.monotonic() - t0) * 1000)
+        usage = data.get("usage", {}) if isinstance(data, dict) else {}
+        input_tokens = usage.get("prompt_tokens") if isinstance(usage, dict) else None
+        output_tokens = usage.get("completion_tokens") if isinstance(usage, dict) else None
+        llm_call = _build_llm_call_meta(
+            provider="custom",
+            model=model,
+            messages=messages,
+            elapsed_ms=elapsed_ms,
+            input_tokens=input_tokens if isinstance(input_tokens, int) else None,
+            output_tokens=output_tokens if isinstance(output_tokens, int) else _estimate_tokens_from_text(result),
+            token_source="provider" if isinstance(input_tokens, int) and isinstance(output_tokens, int) else "estimated",
+        )
+        _log_interaction("custom", model, messages, result, elapsed_ms, llm_call=llm_call)
+        return result, llm_call
     except httpx.HTTPStatusError as e:
         status_code = e.response.status_code
         try:
@@ -614,6 +727,28 @@ async def plan_actions(
     context_snapshot: dict,
     available_actions: list[str],
 ) -> ActionBatch:
+    cfg = request.history_config
+    turns = cfg.turns if cfg else 40
+    max_chars_per_message = cfg.max_chars_per_message if cfg else 4000
+    summary_enabled = cfg.summary_enabled if cfg else True
+    summary_max_chars = cfg.summary_max_chars if cfg else 1200
+
+    # Include recent chat turns so first planning step of each run keeps dialog continuity.
+    recent_messages = request.messages[-turns:]
+    omitted_messages = request.messages[:-turns] if len(request.messages) > turns else []
+    conversation_history = []
+    for msg in recent_messages:
+        text = msg.content or ""
+        if len(text) > max_chars_per_message:
+            text = text[:max_chars_per_message]
+        conversation_history.append(
+            {
+                "role": msg.role,
+                "content": text,
+            }
+        )
+    conversation_summary = _build_history_summary(omitted_messages, max_chars=summary_max_chars) if summary_enabled else ""
+
     history_payload = [
         {
             "iteration": rec.iteration,
@@ -628,6 +763,15 @@ async def plan_actions(
     ]
     planner_input = {
         "original_user_query": original_user_query,
+        "conversation_history": conversation_history,
+        "conversation_omitted_count": max(0, len(request.messages) - len(recent_messages)),
+        "conversation_summary": conversation_summary,
+        "history_config": {
+            "turns": turns,
+            "max_chars_per_message": max_chars_per_message,
+            "summary_enabled": summary_enabled,
+            "summary_max_chars": summary_max_chars,
+        },
         "iteration": iteration,
         "runtime_constraints": {
             "chat_only": request.chat_only,
@@ -658,9 +802,11 @@ async def plan_actions(
         AIProvider.CUSTOM: call_custom,
     }
     caller = callers.get(provider, call_openai)
-    raw = await caller(messages)
+    raw, llm_call = await caller(messages)
     try:
-        return _parse_action_batch_response(raw, iteration=iteration)
+        batch = _parse_action_batch_response(raw, iteration=iteration)
+        batch.llm_call = llm_call
+        return batch
     except Exception:
         # Safe fallback so orchestrator can continue with user-visible guidance.
         return ActionBatch(
@@ -681,6 +827,7 @@ async def plan_actions(
             acceptance=[],
             risks=["planner_parse_failed"],
             next_questions=["是否继续重试规划？"],
+            llm_call=llm_call,
         )
 
 
@@ -708,5 +855,7 @@ async def chat(
         AIProvider.CUSTOM: call_custom,
     }
     caller = callers.get(provider, call_openai)
-    raw = await caller(built)
-    return _parse_ai_response(raw, action)
+    raw, llm_call = await caller(built)
+    parsed = _parse_ai_response(raw, action)
+    parsed.llm_call = llm_call
+    return parsed

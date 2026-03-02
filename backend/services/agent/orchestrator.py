@@ -10,6 +10,7 @@ from backend.models.schemas import (
     ActionBatch,
     ActionSpec,
     ActionType,
+    ChatMessage,
 )
 from backend.services.agent.context import ContextSnapshotBuilder
 from backend.services.agent.executor import ActionExecutor
@@ -58,6 +59,9 @@ class ClosedLoopAgent:
             return self._response_from_run(run, content=run.result_content or "任务已结束", needs_user_trigger=False)
         if run.status == "paused":
             return self._response_from_run(run, content="任务已暂停", needs_user_trigger=False)
+        if run.status == "waiting_user":
+            summary = run.latest_batch.summary if run.latest_batch else "等待用户确认下一步动作"
+            return self._response_from_run(run, content=summary, needs_user_trigger=True)
 
         req = self._require_snapshot(run)
         if not run.latest_batch or not run.pending_action_ids:
@@ -66,11 +70,11 @@ class ClosedLoopAgent:
         await self._execute_pending_actions(run_id, req, run.latest_batch)
         run = self.run_store.get(run_id)
 
-        if run.status in {"completed", "failed", "blocked"}:
+        if run.status in {"completed", "failed", "blocked", "cancelled"}:
             return self._response_from_run(run, content=run.result_content or "任务已结束", needs_user_trigger=False)
         if run.status == "paused":
             return self._response_from_run(run, content="任务已暂停", needs_user_trigger=False)
-        if run.status == "waiting_user" and run.pending_action_ids:
+        if run.status == "waiting_user":
             summary = run.latest_batch.summary if run.latest_batch else "等待用户确认下一步动作"
             return self._response_from_run(run, content=summary, needs_user_trigger=True)
 
@@ -129,6 +133,36 @@ class ClosedLoopAgent:
         )
         return self.run_store.get(run_id)
 
+    async def submit_user_input(self, run_id: str, message: str) -> AIResponse:
+        run = self.run_store.get(run_id)
+        if run.status in {"completed", "failed", "blocked", "cancelled"}:
+            return self._response_from_run(run, content=run.result_content or "任务已结束", needs_user_trigger=False)
+
+        text = (message or "").strip()
+        if not text:
+            raise ValueError("用户补充信息不能为空")
+
+        req = self._require_snapshot(run)
+        req.messages.append(ChatMessage(role="user", content=text))
+        run.request_snapshot = req
+        run.pending_action_ids = []
+        run.active_action_id = None
+        run.status = "running"
+        self.run_store.save(run)
+
+        self.run_store.add_event(
+            run,
+            kind="action",
+            stage="ask_user_reply",
+            title="收到用户补充信息",
+            detail=text[:200],
+            status="completed",
+            iteration=run.iteration if run.iteration > 0 else None,
+            input_data={"message": text},
+        )
+
+        return await self._plan_iteration(run_id)
+
     async def _plan_iteration(self, run_id: str) -> AIResponse:
         run = self.run_store.get(run_id)
         if run.cancel_requested:
@@ -179,7 +213,7 @@ class ClosedLoopAgent:
             status="completed",
             iteration=iteration,
             output_data=batch.model_dump(mode="json"),
-            data={"decision": batch.decision.mode, "action_count": len(batch.actions)},
+            data={"decision": batch.decision.mode, "action_count": len(batch.actions), "llm": batch.llm_call},
         )
 
         for action in batch.actions:
@@ -212,6 +246,17 @@ class ClosedLoopAgent:
             self.run_store.mark_run_finished(run, status="completed")
             self.run_store.mark_run_result(run, result)
             return self._response_from_run(self.run_store.get(run_id), content=msg, needs_user_trigger=False)
+
+        if batch.decision.mode == "ask_user":
+            run = self.run_store.get(run_id)
+            self.run_store.update_status(run, "waiting_user")
+            run = self.run_store.get(run_id)
+            return self._response_from_run(
+                run,
+                content=batch.summary,
+                needs_user_trigger=True,
+                pending_actions=batch.actions,
+            )
 
         waiting = batch.decision.needs_user_trigger and len(batch.actions) > 0
         run = self.run_store.get(run_id)
@@ -313,13 +358,16 @@ class ClosedLoopAgent:
             if outcome.blocked or outcome.record.status == "failed":
                 run = self.run_store.get(run_id)
                 self.run_store.update_status(run, "waiting_user")
+                interrupt_status = "blocked" if outcome.blocked else "failed"
+                if outcome.blocked and action.type in {ActionType.ASK_USER, ActionType.REQUEST_APPROVAL}:
+                    interrupt_status = "waiting_user"
                 self.run_store.add_event(
                     run,
                     kind="system",
                     stage="iteration_summary",
                     title=f"第 {batch.iteration} 轮中断",
                     detail=outcome.assistant_message or outcome.record.error or "执行中断",
-                    status="blocked" if outcome.blocked else "failed",
+                    status=interrupt_status,
                     iteration=batch.iteration,
                     data={"action_id": action.id},
                 )
@@ -452,8 +500,18 @@ class ClosedLoopAgent:
         return ""
 
     def _action_result_detail(self, action: ActionSpec, status: str, output: dict, error: str | None) -> str:
-        if status in {"failed", "blocked"}:
+        if status == "failed":
             return error or "执行失败"
+        if status == "blocked":
+            return error or "执行阻塞"
+        if status == "waiting_user":
+            if action.type == ActionType.ASK_USER:
+                question = output.get("question") if isinstance(output, dict) else None
+                return str(question or "等待用户补充信息")
+            if action.type == ActionType.REQUEST_APPROVAL:
+                prompt = output.get("approval_prompt") if isinstance(output, dict) else None
+                return str(prompt or "等待用户确认是否继续")
+            return "等待用户继续"
 
         if action.type == ActionType.READ_FILES:
             files = output.get("files") if isinstance(output, dict) else None
@@ -501,6 +559,6 @@ class ClosedLoopAgent:
             return f"验收结果：{'满足' if satisfied else '未满足'}，{reason}"
 
         if action.type == ActionType.FINAL_ANSWER:
-            return str(output.get("message") if isinstance(output, dict) else "已生成最终答复")
+            return str(output.get("content") if isinstance(output, dict) else "已生成最终答复")
 
         return "完成"

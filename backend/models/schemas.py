@@ -76,6 +76,13 @@ class ChatMessage(BaseModel):
     chat_only: bool = False
 
 
+class HistoryConfig(BaseModel):
+    turns: int = Field(default=40, ge=1, le=200)
+    max_chars_per_message: int = Field(default=4000, ge=200, le=20000)
+    summary_enabled: bool = True
+    summary_max_chars: int = Field(default=1200, ge=200, le=10000)
+
+
 class CodeSnippet(BaseModel):
     file_path: str
     start_line: int
@@ -141,6 +148,7 @@ class ActionSpec(BaseModel):
     title: str
     reason: str
     input: dict[str, Any] = Field(default_factory=dict)
+    response: dict[str, Any] = Field(default_factory=dict)
     depends_on: list[str] = Field(default_factory=list)
     can_parallel: bool = False
     priority: int = 3
@@ -167,6 +175,7 @@ class ActionBatch(BaseModel):
     acceptance: list[str] = Field(default_factory=list)
     risks: list[str] = Field(default_factory=list)
     next_questions: list[str] = Field(default_factory=list)
+    llm_call: Optional[dict[str, Any]] = None
 
 
 class ActionExecutionRecord(BaseModel):
@@ -215,6 +224,7 @@ class AIRequestSnapshot(BaseModel):
     chat_only: bool = False
     planning_mode: bool = False
     force_code_edit: bool = False
+    history_config: Optional[HistoryConfig] = None
 
 
 class PlanRunInfo(BaseModel):
@@ -258,6 +268,11 @@ class AIRequest(BaseModel):
     chat_only: bool = False
     planning_mode: bool = False
     force_code_edit: bool = False
+    history_config: Optional[HistoryConfig] = None
+
+
+class RunUserInputRequest(BaseModel):
+    message: str
 
 
 class PlanStep(BaseModel):
@@ -285,3 +300,4 @@ class AIResponse(BaseModel):
     run_id: Optional[str] = None
     needs_user_trigger: bool = False
     pending_actions: list[ActionSpec] = Field(default_factory=list)
+    llm_call: Optional[dict[str, Any]] = None

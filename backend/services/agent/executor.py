@@ -44,6 +44,8 @@ class ActionExecutor:
         try:
             output, file_changes, assistant_message, final_answer, blocked = await self._dispatch(req, action, history)
             status = "blocked" if blocked else "completed"
+            if blocked and action.type in {ActionType.ASK_USER, ActionType.REQUEST_APPROVAL}:
+                status = "waiting_user"
             ended = datetime.utcnow().isoformat()
             return ActionExecutionOutcome(
                 record=ActionExecutionRecord(
@@ -123,8 +125,8 @@ class ActionExecutor:
             prompt = str(action.input.get("prompt") or "该动作需要你确认是否继续执行。")
             return {"approval_prompt": prompt}, [], prompt, None, True
         if action.type == ActionType.FINAL_ANSWER:
-            answer = str(action.input.get("message") or "任务已完成。")
-            return {"message": answer}, [], answer, answer, False
+            content = str(action.response.get("content") or "任务已完成。")
+            return {"content": content}, [], content, content, False
         if action.type == ActionType.REPORT_BLOCKER:
             reason = str(action.input.get("reason") or action.reason or "执行受阻")
             return {"reason": reason}, [], reason, None, True
@@ -323,6 +325,9 @@ class ActionExecutor:
                 matched = next((c for c in llm_resp.changes if c.file_path == path), None)
                 if matched:
                     content = matched.file_content
+            llm_call = llm_resp.llm_call
+        else:
+            llm_call = None
 
         if content is None:
             raise ValueError("write action missing content")
@@ -348,7 +353,10 @@ class ActionExecutor:
             after_hash=hashlib.sha256(after.encode("utf-8")).hexdigest(),
             write_result="written",
         )
-        return ({"path": path, "before_len": len(before), "after_len": len(after)}, [change])
+        output = {"path": path, "before_len": len(before), "after_len": len(after)}
+        if llm_call:
+            output["_llm"] = llm_call
+        return (output, [change])
 
     def _delete_file(self, action: ActionSpec) -> dict[str, Any]:
         path = str(action.input.get("path") or "")
@@ -386,10 +394,13 @@ class ActionExecutor:
             chat_only=True,
             snippets=req.snippets,
         )
-        return {
+        output = {
             "satisfied": True,
             "reason": resp.content[:500],
         }
+        if resp.llm_call:
+            output["_llm"] = resp.llm_call
+        return output
 
     def _latest_user_query(self, req: AIRequestSnapshot) -> str:
         for msg in reversed(req.messages):

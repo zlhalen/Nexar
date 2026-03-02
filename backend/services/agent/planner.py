@@ -47,7 +47,7 @@ class PlannerService:
         return ActionBatch(
             iteration=iteration,
             summary="无法可靠规划下一步，等待用户补充信息",
-            decision=ActionBatchDecision(mode="ask_user", reason=reason, needs_user_trigger=False, satisfaction_score=0.0),
+            decision=ActionBatchDecision(mode="ask_user", reason=reason, needs_user_trigger=True, satisfaction_score=0.0),
             actions=[
                 ActionSpec(
                     id="a1",
@@ -68,10 +68,12 @@ class PlannerService:
         action_history: list[ActionExecutionRecord],
     ) -> ActionBatch:
         batch.iteration = iteration
+        if batch.decision.mode == "ask_user":
+            batch.decision.needs_user_trigger = True
         if not batch.actions and batch.decision.mode == "continue":
             batch.decision.mode = "ask_user"
             batch.decision.reason = batch.decision.reason or "planner returned empty actions"
-            batch.decision.needs_user_trigger = False
+            batch.decision.needs_user_trigger = True
         seen: set[str] = set()
         normalized: list[ActionSpec] = []
         for idx, action in enumerate(batch.actions, start=1):
@@ -81,6 +83,16 @@ class PlannerService:
             if action.type == ActionType.FINAL_ANSWER:
                 batch.decision.mode = "done"
                 action.can_parallel = False
+                content = action.response.get("content")
+                if not isinstance(content, str) or not content.strip():
+                    legacy_answer = action.input.get("answer")
+                    legacy_msg = action.input.get("message")
+                    if isinstance(legacy_answer, str) and legacy_answer.strip():
+                        action.response["content"] = legacy_answer
+                    elif isinstance(legacy_msg, str) and legacy_msg.strip():
+                        action.response["content"] = legacy_msg
+                    else:
+                        action.response["content"] = batch.summary
             if not action.success_criteria:
                 action.success_criteria = ["动作执行完成且输出有效"]
             normalized.append(action)

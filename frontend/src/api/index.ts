@@ -28,6 +28,13 @@ export interface ChatMessage {
   planning_mode?: boolean;
 }
 
+export interface HistoryConfig {
+  turns: number;
+  max_chars_per_message: number;
+  summary_enabled: boolean;
+  summary_max_chars: number;
+}
+
 export interface AIRequest {
   provider: string;
   messages: ChatMessage[];
@@ -40,6 +47,7 @@ export interface AIRequest {
   chat_only?: boolean;
   planning_mode?: boolean;
   force_code_edit?: boolean;
+  history_config?: HistoryConfig;
 }
 
 export type ActionType =
@@ -71,6 +79,7 @@ export interface ActionSpec {
   title: string;
   reason: string;
   input: Record<string, any>;
+  response?: Record<string, any>;
   depends_on: string[];
   can_parallel: boolean;
   priority: number;
@@ -297,6 +306,11 @@ export const api = {
   continueRun: (runId: string) =>
     request<AIResponse>(`/ai/runs/${encodeURIComponent(runId)}/continue`, {
       method: 'POST',
+    }),
+  replyRun: (runId: string, message: string) =>
+    request<AIResponse>(`/ai/runs/${encodeURIComponent(runId)}/reply`, {
+      method: 'POST',
+      body: JSON.stringify({ message }),
     }),
   pauseRun: (runId: string) =>
     request<PlanRunInfo>(`/ai/runs/${encodeURIComponent(runId)}/pause`, {

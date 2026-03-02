@@ -2,7 +2,7 @@ import os
 import logging
 from fastapi import APIRouter, BackgroundTasks, HTTPException
 
-from backend.models.schemas import AIRequest, AIResponse, PlanRunInfo, StartRunResponse
+from backend.models.schemas import AIRequest, AIResponse, PlanRunInfo, RunUserInputRequest, StartRunResponse
 from backend.services.agent_system import ClosedLoopAgent
 from backend.services.plan_run_store import PlanRunStore
 
@@ -89,6 +89,19 @@ async def continue_plan_run(run_id: str):
         raise HTTPException(status_code=400, detail=str(e))
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Plan run continue error: {str(e)}")
+
+
+@router.post("/runs/{run_id}/reply", response_model=AIResponse)
+async def reply_plan_run(run_id: str, req: RunUserInputRequest):
+    try:
+        logger.info("[/api/ai/runs/{id}/reply] run_id=%s", run_id)
+        return await agent.submit_user_input(run_id, req.message)
+    except FileNotFoundError as e:
+        raise HTTPException(status_code=404, detail=str(e))
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Plan run reply error: {str(e)}")
 
 
 @router.post("/runs/{run_id}/pause", response_model=PlanRunInfo)
