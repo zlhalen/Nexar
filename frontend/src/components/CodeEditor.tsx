@@ -1,6 +1,6 @@
 import React, { useRef, useCallback } from 'react';
 import Editor, { OnMount } from '@monaco-editor/react';
-import { X, Save, FileCode } from 'lucide-react';
+import { X, FileCode } from 'lucide-react';
 import type { CodeSnippet } from '../api';
 
 interface OpenFile {
@@ -155,7 +155,7 @@ export default function CodeEditor({
         <h2 className="text-xl font-light mb-2">Nexar Code</h2>
         <p className="text-sm">选择文件开始编辑，或使用 AI 助手生成代码</p>
         <div className="mt-6 text-xs space-y-1 text-center opacity-60">
-          <p>Ctrl+S 保存文件</p>
+          <p>修改后自动保存</p>
           <p>在右侧面板与 AI 对话</p>
         </div>
       </div>
@@ -192,14 +192,6 @@ export default function CodeEditor({
         <div className="flex items-center gap-2 px-3 py-1 bg-sidebar-bg border-b border-border-color text-xs text-text-secondary">
           <span>{currentFile.path}</span>
           <span className="ml-auto text-text-secondary">{currentFile.language}</span>
-          {currentFile.modified && (
-            <button
-              className="flex items-center gap-1 px-2 py-0.5 bg-accent text-white rounded text-xs hover:bg-accent-hover"
-              onClick={() => onSave(currentFile.path)}
-            >
-              <Save size={10} /> 保存
-            </button>
-          )}
         </div>
       )}
 

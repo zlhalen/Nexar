@@ -1,13 +1,14 @@
-import React, { useState, useEffect, useCallback } from 'react';
+import React, { useState, useEffect, useCallback, useRef } from 'react';
 import {
   PanelLeftClose, PanelLeftOpen, PanelRightClose, PanelRightOpen,
-  Terminal, Bot,
+  Terminal, Bot, Settings,
 } from 'lucide-react';
 import FileTree from './components/FileTree';
 import CodeEditor from './components/CodeEditor';
 import ChatPanel from './components/ChatPanel';
 import DiffView from './components/DiffView';
 import TerminalPanel from './components/TerminalPanel';
+import SettingsPage from './components/SettingsPage';
 import { api } from './api';
 import type {
   FileItem, ChatMessage, AIResponse, Provider, CodeSnippet, PlanBlock, FileChange, PlanRunInfo,
@@ -84,12 +85,15 @@ export default function App() {
   const [currentProvider, setCurrentProvider] = useState('openai');
   const [statusMsg, setStatusMsg] = useState('');
   const [showDiff, setShowDiff] = useState(false);
+  const [showSettingsPage, setShowSettingsPage] = useState(false);
   const [diffData, setDiffData] = useState<{
     path: string;
     oldContent: string;
     newContent: string;
     language: string;
   } | null>(null);
+  const openFilesRef = useRef<OpenFile[]>([]);
+  const autoSaveTimersRef = useRef<Record<string, number>>({});
 
   const showStatus = useCallback((msg: string, duration = 3000) => {
     setStatusMsg(msg);
@@ -119,6 +123,14 @@ export default function App() {
     loadFileTree();
     loadProviders();
   }, [loadFileTree, loadProviders]);
+
+  useEffect(() => {
+    openFilesRef.current = openFiles;
+  }, [openFiles]);
+
+  useEffect(() => () => {
+    Object.values(autoSaveTimersRef.current).forEach(id => window.clearTimeout(id));
+  }, []);
 
   useEffect(() => {
     if (!activeChatId && chats.length > 0) {
@@ -203,21 +215,58 @@ export default function App() {
     }
   }, [openFiles, showStatus]);
 
+  const flushAutoSave = useCallback(async (path: string) => {
+    const file = openFilesRef.current.find(f => f.path === path);
+    if (!file || !file.modified) return;
+    try {
+      await api.writeFile(path, file.content);
+    } catch (e: any) {
+      showStatus(`自动保存失败: ${e.message}`);
+    }
+  }, [showStatus]);
+
+  const scheduleAutoSave = useCallback((path: string, content: string) => {
+    const oldTimer = autoSaveTimersRef.current[path];
+    if (oldTimer) {
+      window.clearTimeout(oldTimer);
+      delete autoSaveTimersRef.current[path];
+    }
+    autoSaveTimersRef.current[path] = window.setTimeout(async () => {
+      try {
+        await api.writeFile(path, content);
+        setOpenFiles(prev => prev.map(f => (
+          f.path === path && f.content === content
+            ? { ...f, modified: false }
+            : f
+        )));
+      } catch (e: any) {
+        showStatus(`自动保存失败: ${e.message}`);
+      } finally {
+        delete autoSaveTimersRef.current[path];
+      }
+    }, 600);
+  }, [showStatus]);
+
   const closeFile = useCallback((path: string) => {
-    const file = openFiles.find(f => f.path === path);
-    if (file?.modified && !confirm(`${path} 有未保存的修改，确定关闭？`)) return;
+    const oldTimer = autoSaveTimersRef.current[path];
+    if (oldTimer) {
+      window.clearTimeout(oldTimer);
+      delete autoSaveTimersRef.current[path];
+    }
+    void flushAutoSave(path);
     setOpenFiles(prev => prev.filter(f => f.path !== path));
     if (activeFile === path) {
       const remaining = openFiles.filter(f => f.path !== path);
       setActiveFile(remaining.length > 0 ? remaining[remaining.length - 1].path : null);
     }
-  }, [openFiles, activeFile]);
+  }, [openFiles, activeFile, flushAutoSave]);
 
   const updateContent = useCallback((path: string, content: string) => {
     setOpenFiles(prev => prev.map(f =>
       f.path === path ? { ...f, content, modified: true } : f
     ));
-  }, []);
+    scheduleAutoSave(path, content);
+  }, [scheduleAutoSave]);
 
   const saveFile = useCallback(async (path: string) => {
     const file = openFiles.find(f => f.path === path);
@@ -246,6 +295,12 @@ export default function App() {
 
   const deleteItem = useCallback(async (path: string) => {
     try {
+      Object.keys(autoSaveTimersRef.current).forEach(key => {
+        if (key === path || key.startsWith(`${path}/`)) {
+          window.clearTimeout(autoSaveTimersRef.current[key]);
+          delete autoSaveTimersRef.current[key];
+        }
+      });
       await api.deleteItem(path);
       setOpenFiles(prev => prev.filter(f => !f.path.startsWith(path)));
       if (activeFile?.startsWith(path)) {
@@ -261,6 +316,11 @@ export default function App() {
 
   const renameItem = useCallback(async (oldPath: string, newPath: string) => {
     try {
+      const oldTimer = autoSaveTimersRef.current[oldPath];
+      if (oldTimer) {
+        window.clearTimeout(oldTimer);
+        delete autoSaveTimersRef.current[oldPath];
+      }
       await api.renameItem(oldPath, newPath);
       setOpenFiles(prev => prev.map(f =>
         f.path === oldPath ? { ...f, path: newPath } : f
@@ -821,8 +881,19 @@ export default function App() {
           {activeFile && (
             <span>{openFiles.find(f => f.path === activeFile)?.language || 'plaintext'}</span>
           )}
+          <button
+            className="flex items-center gap-1 px-1.5 py-0.5 rounded border border-transparent hover:border-border-color hover:bg-[#1a1f2a]"
+            onClick={() => setShowSettingsPage(true)}
+            title="打开设置"
+          >
+            <Settings size={10} />
+            <span>设置</span>
+          </button>
         </div>
       </div>
+      {showSettingsPage && (
+        <SettingsPage onClose={() => setShowSettingsPage(false)} />
+      )}
     </div>
   );
 }
