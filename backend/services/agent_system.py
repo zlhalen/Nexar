@@ -631,8 +631,106 @@ class ClosedLoopAgent:
 
     async def _execute(self, req: AIRequest, run) -> AIResponse:
         intent = self.brain.intent_router.route(req)
-        context = self.context_engine.build(req)
+        snippet_paths = list({s.file_path for s in (req.snippets or [])})[:10]
+        self.run_store.add_event(
+            run,
+            stage="plan",
+            title="制定执行计划",
+            detail=f"识别意图: {intent.value}",
+            status="running",
+            data={
+                "intent": intent.value,
+                "chat_only": req.chat_only,
+                "planning_mode": req.planning_mode,
+                "current_file": req.current_file,
+                "snippet_paths": snippet_paths,
+            },
+        )
+        self.run_store.add_event(
+            run,
+            stage="scan_files",
+            title="扫描文件上下文",
+            detail="收集当前文件与引用片段",
+            status="running",
+        )
+        explicit_text = self.context_engine.explicit.collect(req)
+        explicit_reason = "已收集上下文"
+        if len(explicit_text) == 0:
+            if req.current_file or req.file_path:
+                explicit_reason = "未读取到目标文件内容"
+            elif req.snippets:
+                explicit_reason = "提供了片段但未命中有效内容"
+            else:
+                explicit_reason = "未选择当前文件且未提供片段"
+        self.run_store.add_event(
+            run,
+            stage="scan_files",
+            title="扫描文件上下文",
+            detail=f"完成，收集上下文 {len(explicit_text)} 字符（{explicit_reason}）",
+            status="completed",
+            data={
+                "chars": len(explicit_text),
+                "reason": explicit_reason,
+                "current_file": req.current_file,
+                "snippet_count": len(req.snippets or []),
+                "snippet_paths": snippet_paths,
+            },
+        )
+        self.run_store.add_event(
+            run,
+            stage="analyze_dependencies",
+            title="分析依赖关系",
+            detail=f"分析目标文件: {req.current_file or req.file_path or 'N/A'}",
+            status="running",
+        )
+        deps_text = self.context_engine.deps.collect(req.current_file or req.file_path)
+        dep_lines = [ln[2:] for ln in deps_text.splitlines() if ln.startswith("- ")]
+        deps_reason = "已解析依赖"
+        if len(deps_text) == 0:
+            deps_reason = "目标文件缺失或未解析到本地可追踪依赖"
+        self.run_store.add_event(
+            run,
+            stage="analyze_dependencies",
+            title="分析依赖关系",
+            detail=f"完成，依赖上下文 {len(deps_text)} 字符（{deps_reason}）",
+            status="completed",
+            data={
+                "chars": len(deps_text),
+                "reason": deps_reason,
+                "resolved_dependencies": dep_lines[:20],
+            },
+        )
+        self.run_store.add_event(
+            run,
+            stage="scan_files",
+            title="构建代码骨架",
+            detail="扫描项目目录与符号",
+            status="running",
+        )
+        skeleton_text = self.context_engine.skeleton.collect()
+        skeleton_files = [ln[2:] for ln in skeleton_text.splitlines() if ln.startswith("- ")]
+        self.run_store.add_event(
+            run,
+            stage="scan_files",
+            title="构建代码骨架",
+            detail=f"完成，骨架上下文 {len(skeleton_text)} 字符",
+            status="completed",
+            data={
+                "chars": len(skeleton_text),
+                "file_count": len(skeleton_files),
+                "sample_files": skeleton_files[:20],
+            },
+        )
+        context = self.context_engine.assembler.assemble(explicit_text, deps_text, skeleton_text, t_max=6000)
         plan = self.brain.task_planner.make_plan(intent, req, context)
+        self.run_store.add_event(
+            run,
+            stage="plan",
+            title="执行计划已生成",
+            detail=f"共 {len(plan.steps)} 个步骤",
+            status="completed",
+            data={"steps": [step.name for step in plan.steps]},
+        )
 
         logger.info(
             "[ClosedLoopAgent] execute_start run_id=%s intent=%s steps=%d",
@@ -645,6 +743,15 @@ class ClosedLoopAgent:
         for step_idx, step in enumerate(plan.steps):
             correction_hint: str | None = None
             self.run_store.mark_step_running(run, step_idx)
+            self.run_store.add_event(
+                run,
+                stage="step",
+                title=f"开始步骤 {step_idx + 1}: {step.name}",
+                detail=step.goal,
+                status="running",
+                step_index=step_idx,
+                data={"kind": step.kind},
+            )
             logger.info(
                 "[ClosedLoopAgent] step_start run_id=%s step_idx=%d step_name=%s kind=%s goal=%s",
                 run.run_id,
@@ -656,6 +763,15 @@ class ClosedLoopAgent:
 
             for attempt in range(1, self.brain.reflector.max_retries + 1):
                 if step.kind == "terminal":
+                    self.run_store.add_event(
+                        run,
+                        stage="execute_script",
+                        title="执行脚本",
+                        detail=step.terminal_command or "",
+                        status="running",
+                        step_index=step_idx,
+                        data={"attempt": attempt, "command": step.terminal_command or ""},
+                    )
                     terminal_result = self.limbs.terminal.run(step.terminal_command or "")
                     ok, hint = self.brain.reflector.validate_terminal(terminal_result)
                     final_response = AIResponse(
@@ -668,6 +784,21 @@ class ClosedLoopAgent:
                         ),
                     )
                     if ok:
+                        self.run_store.add_event(
+                            run,
+                            stage="execute_script",
+                            title="脚本执行完成",
+                            detail=f"exit={terminal_result.returncode}",
+                            status="completed",
+                            step_index=step_idx,
+                            data={
+                                "attempt": attempt,
+                                "command": terminal_result.command,
+                                "exit_code": terminal_result.returncode,
+                                "stdout_preview": (terminal_result.stdout or "")[:2000],
+                                "stderr_preview": (terminal_result.stderr or "")[:1000],
+                            },
+                        )
                         self.run_store.mark_step_completed(run, step_idx, attempt)
                         logger.info(
                             "[ClosedLoopAgent] step_done run_id=%s step_idx=%d attempt=%d",
@@ -677,6 +808,21 @@ class ClosedLoopAgent:
                         )
                         break
                     correction_hint = hint
+                    self.run_store.add_event(
+                        run,
+                        stage="execute_script",
+                        title="脚本执行失败",
+                        detail=hint or terminal_result.stderr or "terminal execution failed",
+                        status="failed",
+                        step_index=step_idx,
+                        data={
+                            "attempt": attempt,
+                            "command": terminal_result.command,
+                            "exit_code": terminal_result.returncode,
+                            "stdout_preview": (terminal_result.stdout or "")[:2000],
+                            "stderr_preview": (terminal_result.stderr or "")[:2000],
+                        },
+                    )
                     self.run_store.mark_step_retry(run, step_idx, attempt, hint or "terminal execution failed")
                     if attempt >= self.brain.reflector.max_retries:
                         self.run_store.mark_step_failed(run, step_idx, attempt, hint or "terminal execution failed")
@@ -690,6 +836,15 @@ class ClosedLoopAgent:
                         break
                     continue
 
+                self.run_store.add_event(
+                    run,
+                    stage="llm_call",
+                    title="请求 AI 执行",
+                    detail=f"步骤 {step_idx + 1} 第 {attempt} 次尝试",
+                    status="running",
+                    step_index=step_idx,
+                    data={"attempt": attempt, "goal": step.goal},
+                )
                 messages = self._inject_context(req.messages, context, step.goal, correction_hint)
                 logger.info(
                     "[ClosedLoopAgent] llm_call run_id=%s step_idx=%d attempt=%d messages=%d",
@@ -713,10 +868,57 @@ class ClosedLoopAgent:
 
                 if step.expects_write and not req.chat_only and not req.planning_mode:
                     llm_result = self.limbs.file_editor.apply(req, llm_result)
+                    for change in llm_result.changes or []:
+                        self.run_store.add_event(
+                            run,
+                            stage="write_file",
+                            title=f"{'写入文件' if change.write_result == 'written' else '写入失败'}: {change.file_path}",
+                            detail=change.error or change.write_result,
+                            status="completed" if change.write_result == "written" else "failed",
+                            step_index=step_idx,
+                            data={
+                                "write_result": change.write_result,
+                                "file_path": change.file_path,
+                                "before_hash": change.before_hash,
+                                "after_hash": change.after_hash,
+                                "before_len": len(change.before_content or ""),
+                                "after_len": len(change.after_content or ""),
+                                "error": change.error,
+                            },
+                        )
+
+                if step.planning_mode and llm_result.plan:
+                    self.run_store.add_event(
+                        run,
+                        stage="subplan",
+                        title="生成子计划",
+                        detail=llm_result.plan.summary or f"步骤数: {len(llm_result.plan.steps)}",
+                        status="completed",
+                        step_index=step_idx,
+                        data={
+                            "steps": len(llm_result.plan.steps),
+                            "step_titles": [s.title for s in llm_result.plan.steps[:20]],
+                            "risks": llm_result.plan.risks[:20],
+                        },
+                    )
 
                 ok, hint = self.brain.reflector.validate_llm(step, llm_result)
                 final_response = llm_result
                 if ok:
+                    self.run_store.add_event(
+                        run,
+                        stage="llm_call",
+                        title="AI 执行成功",
+                        detail=f"action={llm_result.action}",
+                        status="completed",
+                        step_index=step_idx,
+                        data={
+                            "attempt": attempt,
+                            "action": llm_result.action,
+                            "file_path": llm_result.file_path,
+                            "changed_files": [c.file_path for c in (llm_result.changes or [])[:20]],
+                        },
+                    )
                     self.run_store.mark_step_completed(run, step_idx, attempt)
                     logger.info(
                         "[ClosedLoopAgent] step_done run_id=%s step_idx=%d attempt=%d action=%s",
@@ -727,6 +929,15 @@ class ClosedLoopAgent:
                     )
                     break
                 correction_hint = hint
+                self.run_store.add_event(
+                    run,
+                    stage="llm_call",
+                    title="步骤重试",
+                    detail=hint or "validation failed",
+                    status="failed",
+                    step_index=step_idx,
+                    data={"attempt": attempt},
+                )
                 self.run_store.mark_step_retry(run, step_idx, attempt, hint or "validation failed")
                 if attempt >= self.brain.reflector.max_retries:
                     self.run_store.mark_step_failed(run, step_idx, attempt, hint or "validation failed")
@@ -740,12 +951,35 @@ class ClosedLoopAgent:
                     break
 
             if run.steps[step_idx].status == "failed":
+                self.run_store.add_event(
+                    run,
+                    stage="step",
+                    title=f"步骤 {step_idx + 1} 失败",
+                    detail=run.steps[step_idx].error or "步骤执行失败",
+                    status="failed",
+                    step_index=step_idx,
+                )
                 logger.warning("[ClosedLoopAgent] abort_remaining_steps run_id=%s failed_step=%d", run.run_id, step_idx)
                 break
+            self.run_store.add_event(
+                run,
+                stage="step",
+                title=f"步骤 {step_idx + 1} 完成",
+                detail=step.name,
+                status="completed",
+                step_index=step_idx,
+            )
 
         has_failed = any(step.status == "failed" for step in run.steps)
         self.run_store.mark_run_finished(run, status="failed" if has_failed else "completed")
         self.run_store.mark_run_result(run, final_response)
+        self.run_store.add_event(
+            run,
+            stage="finalize",
+            title="执行结束",
+            detail="执行失败" if has_failed else "执行完成",
+            status="failed" if has_failed else "completed",
+        )
         logger.info(
             "[ClosedLoopAgent] execute_done run_id=%s final_status=%s final_action=%s",
             run.run_id,

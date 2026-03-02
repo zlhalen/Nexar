@@ -1,8 +1,6 @@
-![界面](docs/images/logo.png)
-
----
-
 # Nexar Code ⬛️: 为极客打造的白盒 AI 编程助手
+
+🚧 **1.0 版本目前正在开发中。**
 
 [English](./README.md) / 简体中文
 

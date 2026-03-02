@@ -94,6 +94,17 @@ export interface PlanRunStepInfo {
   error?: string;
 }
 
+export interface ExecutionEvent {
+  event_id: string;
+  stage: string;
+  title: string;
+  detail?: string;
+  status: string;
+  timestamp?: string;
+  step_index?: number;
+  data?: Record<string, any>;
+}
+
 export interface PlanRunInfo {
   run_id: string;
   intent: string;
@@ -108,6 +119,7 @@ export interface PlanRunInfo {
   result_file_path?: string;
   result_file_content?: string;
   result_changes?: FileChange[];
+  events?: ExecutionEvent[];
 }
 
 export interface StartRunResponse {

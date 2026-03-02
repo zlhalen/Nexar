@@ -102,6 +102,17 @@ class StepRunInfo(BaseModel):
     error: Optional[str] = None
 
 
+class ExecutionEvent(BaseModel):
+    event_id: str
+    stage: str
+    title: str
+    detail: str = ""
+    status: str = "info"  # info | running | completed | failed
+    timestamp: Optional[str] = None
+    step_index: Optional[int] = None
+    data: dict = Field(default_factory=dict)
+
+
 class PlanRunInfo(BaseModel):
     run_id: str
     intent: str
@@ -116,6 +127,7 @@ class PlanRunInfo(BaseModel):
     result_file_path: Optional[str] = None
     result_file_content: Optional[str] = None
     result_changes: list[FileChange] = Field(default_factory=list)
+    events: list[ExecutionEvent] = Field(default_factory=list)
 
 
 class StartRunResponse(BaseModel):

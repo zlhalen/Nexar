@@ -1,9 +1,7 @@
-![界面](docs/images/logo.png)
-
----
-
 # Nexar Code ⬛️
 The White-Box AI Coding Assistant
+
+🚧 **Version 1.0 is currently under development.**
 
 English / [简体中文](./README_zh.md)
 

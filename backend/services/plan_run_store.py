@@ -7,7 +7,7 @@ import uuid
 from datetime import datetime
 import logging
 
-from backend.models.schemas import AIResponse, PlanRunInfo, StepRunInfo
+from backend.models.schemas import AIResponse, PlanRunInfo, StepRunInfo, ExecutionEvent
 
 LOG_DIR = os.path.join(os.path.dirname(__file__), "..", "..", "logs")
 PLAN_RUN_DIR = os.path.join(LOG_DIR, "plan_runs")
@@ -133,6 +133,38 @@ class PlanRunStore:
             run.result_action,
             run.result_file_path,
             len(run.result_changes),
+        )
+        self.save(run)
+        return run
+
+    def add_event(
+        self,
+        run: PlanRunInfo,
+        stage: str,
+        title: str,
+        detail: str = "",
+        status: str = "info",
+        step_index: int | None = None,
+        data: dict | None = None,
+    ) -> PlanRunInfo:
+        event = ExecutionEvent(
+            event_id=str(uuid.uuid4()),
+            stage=stage,
+            title=title,
+            detail=detail,
+            status=status,
+            timestamp=datetime.utcnow().isoformat(),
+            step_index=step_index,
+            data=data or {},
+        )
+        run.events.append(event)
+        logger.info(
+            "[PlanRunStore] add_event run_id=%s stage=%s status=%s step_index=%s title=%s",
+            run.run_id,
+            stage,
+            status,
+            step_index,
+            title,
         )
         self.save(run)
         return run
