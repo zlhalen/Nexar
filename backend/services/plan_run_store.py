@@ -1,13 +1,22 @@
 from __future__ import annotations
 
 import json
+import logging
 import os
 import threading
 import uuid
 from datetime import datetime
-import logging
+from typing import Any
 
-from backend.models.schemas import AIResponse, PlanRunInfo, StepRunInfo, ExecutionEvent
+from backend.models.schemas import (
+    AIRequest,
+    AIRequestSnapshot,
+    AIResponse,
+    ActionBatch,
+    ActionExecutionRecord,
+    ExecutionEvent,
+    PlanRunInfo,
+)
 
 LOG_DIR = os.path.join(os.path.dirname(__file__), "..", "..", "logs")
 PLAN_RUN_DIR = os.path.join(LOG_DIR, "plan_runs")
@@ -16,38 +25,30 @@ logger = logging.getLogger("plan_run_store")
 
 
 class PlanRunStore:
-    """Persistent step-run state store backed by JSON files."""
+    """Persistent run store backed by JSON files."""
 
     def __init__(self):
         self._lock = threading.Lock()
 
-    def create_run(self, intent: str, steps: list[StepRunInfo], max_retries: int) -> PlanRunInfo:
+    def create_run(self, intent: str, max_retries: int, request: AIRequest | AIRequestSnapshot) -> PlanRunInfo:
+        snapshot = request if isinstance(request, AIRequestSnapshot) else AIRequestSnapshot(**request.model_dump())
         run = PlanRunInfo(
             run_id=str(uuid.uuid4()),
             intent=intent,
             status="running",
             max_retries=max_retries,
-            current_step_index=-1,
-            steps=steps,
             started_at=datetime.utcnow().isoformat(),
-            finished_at=None,
+            request_snapshot=snapshot,
         )
         self.save(run)
-        logger.info("[PlanRunStore] create_run run_id=%s intent=%s steps=%d", run.run_id, intent, len(steps))
+        logger.info("[PlanRunStore] create_run run_id=%s intent=%s", run.run_id, intent)
         return run
 
     def save(self, run: PlanRunInfo) -> PlanRunInfo:
         path = self._path(run.run_id)
         with self._lock:
             with open(path, "w", encoding="utf-8") as f:
-                json.dump(run.model_dump(), f, ensure_ascii=False, indent=2)
-        logger.info(
-            "[PlanRunStore] save run_id=%s status=%s current_step=%d path=%s",
-            run.run_id,
-            run.status,
-            run.current_step_index,
-            path,
-        )
+                json.dump(run.model_dump(mode="json"), f, ensure_ascii=False, indent=2)
         return run
 
     def get(self, run_id: str) -> PlanRunInfo:
@@ -57,115 +58,112 @@ class PlanRunStore:
         with self._lock:
             with open(path, "r", encoding="utf-8") as f:
                 data = json.load(f)
-        logger.info("[PlanRunStore] get run_id=%s status=%s", run_id, data.get("status"))
         return PlanRunInfo(**data)
 
-    def mark_step_running(self, run: PlanRunInfo, step_index: int) -> PlanRunInfo:
-        run.current_step_index = step_index
-        run.steps[step_index].status = "in_progress"
-        logger.info("[PlanRunStore] step_running run_id=%s step_index=%d", run.run_id, step_index)
+    def set_latest_batch(self, run: PlanRunInfo, batch: ActionBatch) -> PlanRunInfo:
+        run.latest_batch = batch
+        run.iteration = batch.iteration
+        run.pending_action_ids = [a.id for a in batch.actions]
         self.save(run)
         return run
 
-    def mark_step_retry(self, run: PlanRunInfo, step_index: int, attempt: int, error: str) -> PlanRunInfo:
-        step = run.steps[step_index]
-        step.attempts = attempt
-        step.error = error
-        step.status = "in_progress"
-        logger.warning(
-            "[PlanRunStore] step_retry run_id=%s step_index=%d attempt=%d error=%s",
-            run.run_id,
-            step_index,
-            attempt,
-            error,
-        )
+    def clear_pending_actions(self, run: PlanRunInfo) -> PlanRunInfo:
+        run.pending_action_ids = []
         self.save(run)
         return run
 
-    def mark_step_completed(self, run: PlanRunInfo, step_index: int, attempt: int) -> PlanRunInfo:
-        step = run.steps[step_index]
-        step.attempts = attempt
-        step.error = None
-        step.status = "completed"
-        logger.info(
-            "[PlanRunStore] step_completed run_id=%s step_index=%d attempt=%d",
-            run.run_id,
-            step_index,
-            attempt,
-        )
+    def add_action_record(self, run: PlanRunInfo, record: ActionExecutionRecord) -> PlanRunInfo:
+        run.action_history.append(record)
         self.save(run)
         return run
 
-    def mark_step_failed(self, run: PlanRunInfo, step_index: int, attempt: int, error: str) -> PlanRunInfo:
-        step = run.steps[step_index]
-        step.attempts = attempt
-        step.error = error
-        step.status = "failed"
-        logger.error(
-            "[PlanRunStore] step_failed run_id=%s step_index=%d attempt=%d error=%s",
-            run.run_id,
-            step_index,
-            attempt,
-            error,
-        )
+    def update_status(self, run: PlanRunInfo, status: str) -> PlanRunInfo:
+        run.status = status
+        self.save(run)
+        return run
+
+    def set_active_action(self, run: PlanRunInfo, action_id: str | None) -> PlanRunInfo:
+        run.active_action_id = action_id
+        self.save(run)
+        return run
+
+    def request_pause(self, run: PlanRunInfo) -> PlanRunInfo:
+        run.pause_requested = True
+        if run.status == "waiting_user":
+            run.status = "paused"
+        self.save(run)
+        return run
+
+    def clear_pause(self, run: PlanRunInfo) -> PlanRunInfo:
+        run.pause_requested = False
+        if run.status == "paused":
+            run.status = "running"
+        self.save(run)
+        return run
+
+    def request_cancel(self, run: PlanRunInfo) -> PlanRunInfo:
+        run.cancel_requested = True
+        if run.status in {"waiting_user", "paused"}:
+            run.status = "cancelled"
+            run.finished_at = datetime.utcnow().isoformat()
         self.save(run)
         return run
 
     def mark_run_finished(self, run: PlanRunInfo, status: str) -> PlanRunInfo:
         run.status = status
         run.finished_at = datetime.utcnow().isoformat()
-        logger.info("[PlanRunStore] run_finished run_id=%s status=%s", run.run_id, status)
         self.save(run)
         return run
 
     def mark_run_result(self, run: PlanRunInfo, result: AIResponse | None) -> PlanRunInfo:
         if result is None:
-            logger.info("[PlanRunStore] run_result_skipped run_id=%s reason=no_result", run.run_id)
             return run
         run.result_action = result.action
         run.result_content = result.content
         run.result_file_path = result.file_path
         run.result_file_content = result.file_content
         run.result_changes = result.changes or []
-        logger.info(
-            "[PlanRunStore] run_result run_id=%s action=%s file_path=%s changes=%d",
-            run.run_id,
-            run.result_action,
-            run.result_file_path,
-            len(run.result_changes),
-        )
         self.save(run)
         return run
 
     def add_event(
         self,
         run: PlanRunInfo,
+        *,
+        kind: str,
         stage: str,
         title: str,
         detail: str = "",
         status: str = "info",
-        step_index: int | None = None,
-        data: dict | None = None,
+        iteration: int | None = None,
+        action_id: str | None = None,
+        parent_action_id: str | None = None,
+        data: dict[str, Any] | None = None,
+        input_data: dict[str, Any] | None = None,
+        output_data: dict[str, Any] | None = None,
+        metrics: dict[str, Any] | None = None,
+        artifacts: list[str] | None = None,
+        error: str | None = None,
     ) -> PlanRunInfo:
         event = ExecutionEvent(
             event_id=str(uuid.uuid4()),
+            kind=kind,
             stage=stage,
             title=title,
             detail=detail,
             status=status,
             timestamp=datetime.utcnow().isoformat(),
-            step_index=step_index,
+            iteration=iteration,
+            action_id=action_id,
+            parent_action_id=parent_action_id,
             data=data or {},
+            input=input_data,
+            output=output_data,
+            metrics=metrics,
+            artifacts=artifacts or [],
+            error=error,
         )
         run.events.append(event)
-        logger.info(
-            "[PlanRunStore] add_event run_id=%s stage=%s status=%s step_index=%s title=%s",
-            run.run_id,
-            stage,
-            status,
-            step_index,
-            title,
-        )
         self.save(run)
         return run
 

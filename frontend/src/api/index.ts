@@ -42,6 +42,62 @@ export interface AIRequest {
   force_code_edit?: boolean;
 }
 
+export type ActionType =
+  | 'scan_workspace'
+  | 'read_files'
+  | 'search_code'
+  | 'extract_symbols'
+  | 'analyze_dependencies'
+  | 'summarize_context'
+  | 'propose_subplan'
+  | 'run_command'
+  | 'run_tests'
+  | 'run_lint'
+  | 'run_build'
+  | 'create_file'
+  | 'update_file'
+  | 'delete_file'
+  | 'move_file'
+  | 'apply_patch'
+  | 'validate_result'
+  | 'ask_user'
+  | 'request_approval'
+  | 'final_answer'
+  | 'report_blocker';
+
+export interface ActionSpec {
+  id: string;
+  type: ActionType;
+  title: string;
+  reason: string;
+  input: Record<string, any>;
+  depends_on: string[];
+  can_parallel: boolean;
+  priority: number;
+  timeout_sec: number;
+  max_retries: number;
+  success_criteria: string[];
+  artifacts: string[];
+}
+
+export interface ActionBatchDecision {
+  mode: 'continue' | 'ask_user' | 'done' | 'blocked';
+  reason?: string;
+  needs_user_trigger: boolean;
+  satisfaction_score?: number;
+}
+
+export interface ActionBatch {
+  version: string;
+  iteration: number;
+  summary: string;
+  decision: ActionBatchDecision;
+  actions: ActionSpec[];
+  acceptance: string[];
+  risks: string[];
+  next_questions: string[];
+}
+
 export interface PlanStep {
   title: string;
   detail?: string;
@@ -82,6 +138,9 @@ export interface AIResponse {
   plan?: PlanBlock;
   changes?: FileChange[];
   run?: PlanRunInfo;
+  run_id?: string;
+  needs_user_trigger?: boolean;
+  pending_actions?: ActionSpec[];
 }
 
 export interface PlanRunStepInfo {
@@ -96,13 +155,21 @@ export interface PlanRunStepInfo {
 
 export interface ExecutionEvent {
   event_id: string;
+  kind?: string;
   stage: string;
   title: string;
   detail?: string;
   status: string;
   timestamp?: string;
-  step_index?: number;
+  iteration?: number;
+  action_id?: string;
+  parent_action_id?: string;
   data?: Record<string, any>;
+  input?: Record<string, any>;
+  output?: Record<string, any>;
+  metrics?: Record<string, any>;
+  artifacts?: string[];
+  error?: string;
 }
 
 export interface PlanRunInfo {
@@ -114,6 +181,24 @@ export interface PlanRunInfo {
   steps: PlanRunStepInfo[];
   started_at?: string;
   finished_at?: string;
+  iteration: number;
+  latest_batch?: ActionBatch;
+  pending_action_ids: string[];
+  pause_requested?: boolean;
+  cancel_requested?: boolean;
+  active_action_id?: string;
+  action_history?: Array<{
+    iteration: number;
+    action_id: string;
+    action_type: ActionType;
+    status: string;
+    title: string;
+    reason: string;
+    input: Record<string, any>;
+    output: Record<string, any>;
+    artifacts: string[];
+    error?: string;
+  }>;
   result_action?: string;
   result_content?: string;
   result_file_path?: string;
@@ -208,6 +293,22 @@ export const api = {
     request<StartRunResponse>('/ai/runs/start', {
       method: 'POST',
       body: JSON.stringify(req),
+    }),
+  continueRun: (runId: string) =>
+    request<AIResponse>(`/ai/runs/${encodeURIComponent(runId)}/continue`, {
+      method: 'POST',
+    }),
+  pauseRun: (runId: string) =>
+    request<PlanRunInfo>(`/ai/runs/${encodeURIComponent(runId)}/pause`, {
+      method: 'POST',
+    }),
+  resumeRun: (runId: string) =>
+    request<PlanRunInfo>(`/ai/runs/${encodeURIComponent(runId)}/resume`, {
+      method: 'POST',
+    }),
+  cancelRun: (runId: string) =>
+    request<PlanRunInfo>(`/ai/runs/${encodeURIComponent(runId)}/cancel`, {
+      method: 'POST',
     }),
 
   createTerminalSession: (payload?: { cwd?: string; shell?: string }) =>

@@ -3,7 +3,21 @@ import json
 import re
 import logging
 from datetime import datetime
-from backend.models.schemas import AIProvider, ChatMessage, AIResponse, CodeSnippet, PlanBlock, PlanStep, FileChange
+from backend.models.schemas import (
+    AIProvider,
+    ChatMessage,
+    AIResponse,
+    CodeSnippet,
+    PlanBlock,
+    PlanStep,
+    FileChange,
+    AIRequestSnapshot,
+    ActionBatch,
+    ActionBatchDecision,
+    ActionExecutionRecord,
+    ActionSpec,
+    ActionType,
+)
 
 logger = logging.getLogger("ai_service")
 
@@ -98,6 +112,50 @@ SYSTEM_PROMPT = """你是一个专业的AI编程助手。你可以帮助用户�
 - 当用户未明确要求“只改引用片段”时，引用片段默认仅作为上下文参考，按用户真实意图决定是回答问题还是修改代码
 - file_path使用相对路径
 - 代码要符合最佳实践，有适当注释"""
+
+PLANNER_SYSTEM_PROMPT = """你是 Nexar 的动作规划器（Planner）。
+
+你必须基于输入上下文，输出下一轮 ActionBatch JSON，严格遵守：
+1) 不要写死固定流程，不要假设状态机；只决定“下一批 actions”。
+2) 输出必须是可执行、可验证的动作（每个 action 都要有 success_criteria）。
+3) 信息不足时输出 ask_user / request_approval，不要臆造文件内容。
+4) 当目标满足时，decision.mode=done，可包含 final_answer 动作。
+5) 只返回 JSON，不要 Markdown，不要解释文字。
+6) 发现/搜索类动作要遵守前置顺序：先 scan_workspace，再 search_code/read_files/analyze_dependencies（可用 depends_on 表达）。
+7) 对 create_file/update_file/apply_patch 动作：input 必须包含 path，且至少包含 content 或 instruction 之一。
+
+输出格式：
+{
+  "version": "1.0",
+  "iteration": 1,
+  "summary": "本轮目标",
+  "decision": {
+    "mode": "continue|ask_user|done|blocked",
+    "reason": "可选",
+    "needs_user_trigger": true,
+    "satisfaction_score": 0.0
+  },
+  "actions": [
+    {
+      "id": "a1",
+      "type": "scan_workspace|read_files|search_code|extract_symbols|analyze_dependencies|summarize_context|propose_subplan|run_command|run_tests|run_lint|run_build|create_file|update_file|delete_file|move_file|apply_patch|validate_result|ask_user|request_approval|final_answer|report_blocker",
+      "title": "动作标题",
+      "reason": "动作原因",
+      "input": {},
+      "depends_on": [],
+      "can_parallel": false,
+      "priority": 3,
+      "timeout_sec": 120,
+      "max_retries": 1,
+      "success_criteria": ["完成标准"],
+      "artifacts": []
+    }
+  ],
+  "acceptance": [],
+  "risks": [],
+  "next_questions": []
+}
+"""
 
 
 def _slice_lines(content: str, start_line: int, end_line: int) -> str:
@@ -321,6 +379,28 @@ def _parse_ai_response(raw: str, action: str) -> AIResponse:
     return AIResponse(content=raw, action=fallback_action)
 
 
+def _extract_json_payload(raw: str) -> dict:
+    json_match = re.search(r'```json\s*\n?(.*?)\n?\s*```', raw, re.DOTALL)
+    if json_match:
+        return json.loads(json_match.group(1))
+
+    text = raw.strip()
+    if text.startswith("{") and text.endswith("}"):
+        return json.loads(text)
+
+    obj_match = re.search(r"\{[\s\S]*\}", raw, re.DOTALL)
+    if obj_match:
+        return json.loads(obj_match.group(0))
+    raise ValueError("planner output is not valid JSON")
+
+
+def _parse_action_batch_response(raw: str, iteration: int) -> ActionBatch:
+    payload = _extract_json_payload(raw)
+    payload["iteration"] = iteration
+    batch = ActionBatch.model_validate(payload)
+    return batch
+
+
 async def call_openai(messages: list[dict]) -> str:
     import openai
     import time
@@ -523,6 +603,85 @@ async def call_custom(messages: list[dict]) -> str:
         error_msg = f"调用自定义 API 时发生错误: {str(e)}"
         _log_interaction("custom", model, messages, "", int((time.monotonic() - t0) * 1000), error=error_msg)
         raise ValueError(error_msg) from e
+
+
+async def plan_actions(
+    provider: AIProvider,
+    request: AIRequestSnapshot,
+    iteration: int,
+    original_user_query: str,
+    action_history: list[ActionExecutionRecord],
+    context_snapshot: dict,
+    available_actions: list[str],
+) -> ActionBatch:
+    history_payload = [
+        {
+            "iteration": rec.iteration,
+            "action_id": rec.action_id,
+            "action_type": rec.action_type.value,
+            "status": rec.status,
+            "title": rec.title,
+            "error": rec.error,
+            "output": rec.output,
+        }
+        for rec in action_history[-40:]
+    ]
+    planner_input = {
+        "original_user_query": original_user_query,
+        "iteration": iteration,
+        "runtime_constraints": {
+            "chat_only": request.chat_only,
+            "force_code_edit": request.force_code_edit,
+            "range_start": request.range_start,
+            "range_end": request.range_end,
+        },
+        "current_file": request.current_file,
+        "snippets": [
+            {
+                "file_path": s.file_path,
+                "start_line": s.start_line,
+                "end_line": s.end_line,
+            }
+            for s in (request.snippets or [])[:50]
+        ],
+        "context_snapshot": context_snapshot,
+        "prior_actions": history_payload,
+        "available_actions": available_actions,
+    }
+    messages = [
+        {"role": "system", "content": PLANNER_SYSTEM_PROMPT},
+        {"role": "user", "content": json.dumps(planner_input, ensure_ascii=False)},
+    ]
+    callers = {
+        AIProvider.OPENAI: call_openai,
+        AIProvider.CLAUDE: call_claude,
+        AIProvider.CUSTOM: call_custom,
+    }
+    caller = callers.get(provider, call_openai)
+    raw = await caller(messages)
+    try:
+        return _parse_action_batch_response(raw, iteration=iteration)
+    except Exception:
+        # Safe fallback so orchestrator can continue with user-visible guidance.
+        return ActionBatch(
+            version="1.0",
+            iteration=iteration,
+            summary="Planner 输出不可解析，等待用户确认下一步。",
+            decision=ActionBatchDecision(mode="ask_user", reason="planner_parse_failed", needs_user_trigger=False),
+            actions=[
+                ActionSpec(
+                    id="a1",
+                    type=ActionType.ASK_USER,
+                    title="请求用户确认",
+                    reason="planner_parse_failed",
+                    input={"question": "本轮规划解析失败。是否继续尝试重新规划？"},
+                    success_criteria=["用户给出下一步偏好"],
+                )
+            ],
+            acceptance=[],
+            risks=["planner_parse_failed"],
+            next_questions=["是否继续重试规划？"],
+        )
 
 
 async def chat(

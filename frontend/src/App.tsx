@@ -11,7 +11,7 @@ import TerminalPanel from './components/TerminalPanel';
 import SettingsPage from './components/SettingsPage';
 import { api } from './api';
 import type {
-  FileItem, ChatMessage, AIResponse, Provider, CodeSnippet, ExecutionEvent,
+  FileItem, ChatMessage, AIResponse, Provider, CodeSnippet, ExecutionEvent, ActionSpec,
 } from './api';
 
 interface OpenFile {
@@ -33,6 +33,9 @@ interface ChatSession {
   lastAIResult: AIResponse | null;
   executionEvents: ExecutionEvent[];
   draftSnippets: CodeSnippet[];
+  runId?: string;
+  needsUserTrigger: boolean;
+  pendingActions: ActionSpec[];
 }
 
 function createChatSession(index: number): ChatSession {
@@ -43,6 +46,9 @@ function createChatSession(index: number): ChatSession {
     lastAIResult: null,
     executionEvents: [],
     draftSnippets: [],
+    runId: undefined,
+    needsUserTrigger: false,
+    pendingActions: [],
   };
 }
 
@@ -91,6 +97,7 @@ export default function App() {
   } | null>(null);
   const openFilesRef = useRef<OpenFile[]>([]);
   const autoSaveTimersRef = useRef<Record<string, number>>({});
+  const runPollersRef = useRef<Record<string, boolean>>({});
 
   const showStatus = useCallback((msg: string, duration = 3000) => {
     setStatusMsg(msg);
@@ -127,6 +134,12 @@ export default function App() {
 
   useEffect(() => () => {
     Object.values(autoSaveTimersRef.current).forEach(id => window.clearTimeout(id));
+  }, []);
+
+  useEffect(() => () => {
+    Object.keys(runPollersRef.current).forEach(key => {
+      runPollersRef.current[key] = false;
+    });
   }, []);
 
   useEffect(() => {
@@ -399,7 +412,10 @@ export default function App() {
     if (!activeChatId) return;
     setChats(prev => prev.map(chat =>
       chat.id === activeChatId
-        ? { ...chat, messages: [], lastAIResult: null, executionEvents: [], draftSnippets: [] }
+        ? {
+          ...chat, messages: [], lastAIResult: null, executionEvents: [], draftSnippets: [],
+          runId: undefined, needsUserTrigger: false, pendingActions: [],
+        }
         : chat
     ));
   }, [activeChatId]);
@@ -469,6 +485,9 @@ export default function App() {
               lastAIResult: result,
               executionEvents: result.run?.events || chat.executionEvents,
               draftSnippets: [],
+              runId: result.run_id || result.run?.run_id || chat.runId,
+              needsUserTrigger: result.needs_user_trigger === true,
+              pendingActions: result.pending_actions || [],
             }
           : chat
       ));
@@ -509,6 +528,66 @@ export default function App() {
       setAiLoading(false);
     }
   }, [activeChatId, chats, currentProvider, activeFile, openFiles, loadFileTree, showStatus]);
+
+  const executeAllPendingActions = useCallback(async () => {
+    if (!activeChatId) return;
+    const target = chats.find(c => c.id === activeChatId);
+    if (!target?.runId || aiLoading) return;
+    const chatId = activeChatId;
+    const runId = target.runId;
+    setAiLoading(true);
+    runPollersRef.current[runId] = true;
+    const pollRun = async () => {
+      while (runPollersRef.current[runId]) {
+        try {
+          const run = await api.getRun(runId);
+          setChats(prev => prev.map(chat =>
+            chat.id === chatId
+              ? {
+                ...chat,
+                executionEvents: run.events || chat.executionEvents,
+                pendingActions: (run.latest_batch?.actions || []).filter(a => (run.pending_action_ids || []).includes(a.id)),
+                needsUserTrigger: (run.pending_action_ids || []).length > 0 && run.status === 'waiting_user',
+                runId: run.run_id || chat.runId,
+              }
+              : chat
+          ));
+        } catch {
+          // Ignore transient polling errors.
+        }
+        await new Promise(resolve => setTimeout(resolve, 500));
+      }
+    };
+    void pollRun();
+    try {
+      const result = await api.continueRun(runId);
+      const assistantMsg: ChatMessage = { role: 'assistant', content: result.content };
+      setChats(prev => prev.map(chat =>
+        chat.id === chatId
+          ? {
+            ...chat,
+            messages: [...chat.messages, assistantMsg],
+            lastAIResult: result,
+            executionEvents: result.run?.events || chat.executionEvents,
+            runId: result.run_id || result.run?.run_id || chat.runId,
+            needsUserTrigger: result.needs_user_trigger === true,
+            pendingActions: result.pending_actions || [],
+          }
+          : chat
+      ));
+      if (result.file_path && result.file_content) {
+        await loadFileTree();
+      }
+    } catch (e: any) {
+      const errMsg: ChatMessage = { role: 'assistant', content: `❌ 错误: ${e.message}` };
+      setChats(prev => prev.map(chat =>
+        chat.id === chatId ? { ...chat, messages: [...chat.messages, errMsg] } : chat
+      ));
+    } finally {
+      runPollersRef.current[runId] = false;
+      setAiLoading(false);
+    }
+  }, [activeChatId, chats, aiLoading, loadFileTree]);
 
   const handleDiffApply = useCallback(async () => {
     if (!diffData) return;
@@ -639,14 +718,17 @@ export default function App() {
                   currentProvider={currentProvider}
                   onProviderChange={setCurrentProvider}
                   onSend={sendMessage}
-                onClear={clearActiveChat}
-                activeFile={activeFile}
-                lastAIResult={activeChat?.lastAIResult || null}
-                executionEvents={activeChat?.executionEvents || []}
-                onApplyFile={applyFile}
-                onShowDiff={showDiffView}
-                getCurrentFileContent={getCurrentFileContent}
-              />
+                  onClear={clearActiveChat}
+                  activeFile={activeFile}
+                  lastAIResult={activeChat?.lastAIResult || null}
+                  executionEvents={activeChat?.executionEvents || []}
+                  onApplyFile={applyFile}
+                  onShowDiff={showDiffView}
+                  getCurrentFileContent={getCurrentFileContent}
+                  canExecuteAll={(activeChat?.pendingActions?.length || 0) > 0}
+                  pendingActions={activeChat?.pendingActions || []}
+                  onExecuteAll={executeAllPendingActions}
+                />
               </div>
             </>
           )}
@@ -674,6 +756,16 @@ export default function App() {
             <span>Terminal</span>
           </button>
           {activeFile && <span>{activeFile}</span>}
+          {activeChat?.pendingActions && activeChat.pendingActions.length > 0 && (
+            <button
+              className="ml-2 px-1.5 py-0.5 rounded border border-[#2f72d6]/50 text-[#9ec6ff] hover:bg-[#1a2433]"
+              onClick={executeAllPendingActions}
+              disabled={aiLoading}
+              title="执行当前轮全部子计划"
+            >
+              执行子计划 {activeChat.pendingActions.length}
+            </button>
+          )}
         </div>
         <div className="flex items-center gap-2.5">
           {statusMsg && <span className="animate-pulse">{statusMsg}</span>}

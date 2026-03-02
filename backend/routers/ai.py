@@ -76,3 +76,55 @@ async def start_plan_run(req: AIRequest, background_tasks: BackgroundTasks):
         raise HTTPException(status_code=400, detail=str(e))
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Plan run start error: {str(e)}")
+
+
+@router.post("/runs/{run_id}/continue", response_model=AIResponse)
+async def continue_plan_run(run_id: str):
+    try:
+        logger.info("[/api/ai/runs/{id}/continue] run_id=%s", run_id)
+        return await agent.continue_run(run_id)
+    except FileNotFoundError as e:
+        raise HTTPException(status_code=404, detail=str(e))
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Plan run continue error: {str(e)}")
+
+
+@router.post("/runs/{run_id}/pause", response_model=PlanRunInfo)
+async def pause_plan_run(run_id: str):
+    try:
+        logger.info("[/api/ai/runs/{id}/pause] run_id=%s", run_id)
+        return agent.pause_run(run_id)
+    except FileNotFoundError as e:
+        raise HTTPException(status_code=404, detail=str(e))
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Plan run pause error: {str(e)}")
+
+
+@router.post("/runs/{run_id}/resume", response_model=PlanRunInfo)
+async def resume_plan_run(run_id: str):
+    try:
+        logger.info("[/api/ai/runs/{id}/resume] run_id=%s", run_id)
+        return agent.resume_run(run_id)
+    except FileNotFoundError as e:
+        raise HTTPException(status_code=404, detail=str(e))
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Plan run resume error: {str(e)}")
+
+
+@router.post("/runs/{run_id}/cancel", response_model=PlanRunInfo)
+async def cancel_plan_run(run_id: str):
+    try:
+        logger.info("[/api/ai/runs/{id}/cancel] run_id=%s", run_id)
+        return agent.cancel_run(run_id)
+    except FileNotFoundError as e:
+        raise HTTPException(status_code=404, detail=str(e))
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Plan run cancel error: {str(e)}")
