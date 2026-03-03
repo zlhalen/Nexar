@@ -40,6 +40,14 @@ class DeleteRequest(BaseModel):
     path: str
 
 
+class WorkspaceSwitchRequest(BaseModel):
+    path: str
+
+
+class WorkspaceInfo(BaseModel):
+    workspace_root: str
+
+
 class TerminalSessionCreateRequest(BaseModel):
     cwd: str = ""
     shell: str = "/bin/bash"

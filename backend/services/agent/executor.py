@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import difflib
 import hashlib
+import json
 import os
 import re
 import shlex
@@ -202,21 +203,86 @@ class ActionExecutor:
 
     def _search_code(self, action: ActionSpec) -> dict[str, Any]:
         keyword = str(action.input.get("query") or "").strip()
-        paths = action.input.get("paths") or []
+        raw_paths = action.input.get("paths") or []
+        raw_root = str(action.input.get("root") or "").strip()
+        regex_raw = action.input.get("regex", False)
         limit = int(action.input.get("limit", 50))
         if not keyword:
             return {"query": "", "matches": [], "reason": "empty_query"}
+        if limit <= 0:
+            return {"query": keyword, "matches": [], "reason": "invalid_limit"}
 
-        root = Path(file_service.get_workspace_root())
-        candidates: list[Path]
-        if paths:
-            candidates = [root / p for p in paths]
+        workspace_root = Path(file_service.get_workspace_root()).resolve()
+        search_root = workspace_root
+        if raw_root:
+            root_candidate = Path(raw_root)
+            if not root_candidate.is_absolute():
+                root_candidate = workspace_root / root_candidate
+            search_root = root_candidate.resolve()
+            try:
+                search_root.relative_to(workspace_root)
+            except ValueError:
+                return {
+                    "query": keyword,
+                    "matches": [],
+                    "reason": "root_outside_workspace",
+                    "workspace_root": str(workspace_root),
+                    "root": str(search_root),
+                }
+            if not search_root.exists():
+                return {"query": keyword, "matches": [], "reason": "root_not_found", "root": str(search_root)}
+            if not search_root.is_dir():
+                return {"query": keyword, "matches": [], "reason": "root_not_dir", "root": str(search_root)}
+
+        regex = False
+        if isinstance(regex_raw, bool):
+            regex = regex_raw
+        elif isinstance(regex_raw, str):
+            regex = regex_raw.strip().lower() in {"1", "true", "yes", "on"}
+
+        try:
+            pattern = re.compile(keyword if regex else re.escape(keyword), re.IGNORECASE)
+        except re.error as err:
+            return {"query": keyword, "matches": [], "reason": f"invalid_regex: {err}", "regex": True}
+
+        path_inputs: list[str]
+        if isinstance(raw_paths, str):
+            path_inputs = [raw_paths]
+        elif isinstance(raw_paths, list):
+            path_inputs = [str(p) for p in raw_paths if p]
         else:
-            candidates = [p for p in root.rglob("*") if p.is_file()]
+            path_inputs = []
+
+        candidates: list[Path] = []
+        path_warnings: list[str] = []
+        if path_inputs:
+            for raw_path in path_inputs:
+                p = Path(raw_path)
+                target = (search_root / p).resolve() if not p.is_absolute() else p.resolve()
+                try:
+                    target.relative_to(search_root)
+                except ValueError:
+                    path_warnings.append(f"skip_outside_root:{raw_path}")
+                    continue
+                if not target.exists():
+                    path_warnings.append(f"skip_not_found:{raw_path}")
+                    continue
+                if target.is_file():
+                    candidates.append(target)
+                    continue
+                if target.is_dir():
+                    candidates.extend([sub for sub in target.rglob("*") if sub.is_file()])
+        else:
+            candidates = [p for p in search_root.rglob("*") if p.is_file()]
+
         matches: list[dict[str, Any]] = []
-        pattern = re.compile(re.escape(keyword), re.IGNORECASE)
         for file_path in candidates:
-            rel = str(file_path.relative_to(root)) if file_path.is_absolute() else str(file_path)
+            try:
+                rel = str(file_path.resolve().relative_to(workspace_root))
+            except ValueError:
+                path_warnings.append(f"skip_unresolvable:{str(file_path)}")
+                continue
+
             if self._ignored(rel):
                 continue
             try:
@@ -227,8 +293,20 @@ class ActionExecutor:
                 if pattern.search(line):
                     matches.append({"path": rel, "line": idx, "text": line[:240]})
                     if len(matches) >= limit:
-                        return {"query": keyword, "matches": matches}
-        return {"query": keyword, "matches": matches}
+                        return {
+                            "query": keyword,
+                            "regex": regex,
+                            "root": str(search_root),
+                            "matches": matches,
+                            "warnings": path_warnings[:20],
+                        }
+        return {
+            "query": keyword,
+            "regex": regex,
+            "root": str(search_root),
+            "matches": matches,
+            "warnings": path_warnings[:20],
+        }
 
     def _extract_symbols(self, action: ActionSpec) -> dict[str, Any]:
         paths = action.input.get("paths") or []
@@ -293,6 +371,40 @@ class ActionExecutor:
         command = str(action.input.get("command") or "").strip()
         if not command:
             return {"command": "", "exit_code": 1, "stderr": "empty command"}
+        workspace_root = Path(file_service.get_workspace_root()).resolve()
+        raw_cwd = str(action.input.get("cwd") or "").strip()
+        run_cwd = workspace_root
+        if raw_cwd:
+            cwd_candidate = Path(raw_cwd)
+            if not cwd_candidate.is_absolute():
+                cwd_candidate = workspace_root / cwd_candidate
+            run_cwd = cwd_candidate.resolve()
+            try:
+                run_cwd.relative_to(workspace_root)
+            except ValueError:
+                return {
+                    "command": command,
+                    "cwd": str(run_cwd),
+                    "exit_code": 1,
+                    "stderr": (
+                        f"cwd is outside workspace: {run_cwd}. "
+                        f"workspace_root={workspace_root}"
+                    ),
+                }
+            if not run_cwd.exists():
+                return {
+                    "command": command,
+                    "cwd": str(run_cwd),
+                    "exit_code": 1,
+                    "stderr": f"cwd not found: {run_cwd}",
+                }
+            if not run_cwd.is_dir():
+                return {
+                    "command": command,
+                    "cwd": str(run_cwd),
+                    "exit_code": 1,
+                    "stderr": f"cwd is not a directory: {run_cwd}",
+                }
         precheck = self._precheck_interactive_command(command)
         if precheck:
             return precheck
@@ -304,7 +416,7 @@ class ActionExecutor:
         try:
             proc = subprocess.run(
                 command,
-                cwd=file_service.get_workspace_root(),
+                cwd=str(run_cwd),
                 shell=True,
                 capture_output=True,
                 text=True,
@@ -314,6 +426,7 @@ class ActionExecutor:
             )
             return {
                 "command": command,
+                "cwd": str(run_cwd),
                 "exit_code": proc.returncode,
                 "stdout": (proc.stdout or "")[:6000],
                 "stderr": (proc.stderr or "")[:4000],
@@ -321,6 +434,7 @@ class ActionExecutor:
         except subprocess.TimeoutExpired as err:
             return {
                 "command": command,
+                "cwd": str(run_cwd),
                 "exit_code": 124,
                 "stdout": str(err.stdout or "")[:6000],
                 "stderr": (
@@ -353,17 +467,16 @@ class ActionExecutor:
                 snippets=req.snippets,
                 chat_only=False,
             )
-            content = llm_resp.file_content
-            if content is None and llm_resp.changes:
-                matched = next((c for c in llm_resp.changes if c.file_path == path), None)
-                if matched:
-                    content = matched.file_content
+            content = self._extract_write_content(path=path, llm_resp=llm_resp)
             llm_call = llm_resp.llm_call
         else:
             llm_call = None
 
         if content is None:
-            raise ValueError("write action missing content")
+            hint = ""
+            if instruction:
+                hint = "（模型未返回 file_content/changes，且内容解析失败）"
+            raise ValueError(f"write action missing content{hint}")
 
         file_service.write_file(path, str(content))
         after = str(content)
@@ -390,6 +503,87 @@ class ActionExecutor:
         if llm_call:
             output["_llm"] = llm_call
         return (output, [change])
+
+    def _extract_write_content(self, path: str, llm_resp: AIResponse) -> str | None:
+        if llm_resp.file_content is not None:
+            return str(llm_resp.file_content)
+
+        if llm_resp.changes:
+            matched = self._find_change_content(path, llm_resp.changes)
+            if matched is not None:
+                return matched
+
+        raw = (llm_resp.content or "").strip()
+        if not raw:
+            return None
+
+        parsed = self._parse_possible_json(raw)
+        if isinstance(parsed, dict):
+            file_content = parsed.get("file_content")
+            if file_content is not None:
+                return str(file_content)
+            changes = parsed.get("changes")
+            if isinstance(changes, list):
+                matched = self._find_change_content(path, changes)
+                if matched is not None:
+                    return matched
+
+        code_block = self._extract_single_code_block(raw)
+        if code_block is not None:
+            return code_block
+
+        return None
+
+    def _find_change_content(self, path: str, changes: list[Any]) -> str | None:
+        target = Path(path).as_posix()
+        for item in changes:
+            if not isinstance(item, (dict, FileChange)):
+                continue
+            file_path = item.file_path if isinstance(item, FileChange) else item.get("file_path")
+            file_content = item.file_content if isinstance(item, FileChange) else item.get("file_content")
+            if file_content is None:
+                continue
+            if not file_path:
+                continue
+            candidate = Path(str(file_path)).as_posix()
+            if candidate == target:
+                return str(file_content)
+        return None
+
+    def _parse_possible_json(self, raw: str) -> dict[str, Any] | None:
+        text = raw.strip()
+        if not text:
+            return None
+
+        fence_match = re.search(r"```json\s*([\s\S]*?)\s*```", text, re.IGNORECASE)
+        candidates: list[str] = []
+        if fence_match:
+            candidates.append(fence_match.group(1).strip())
+
+        candidates.append(text)
+        brace_match = re.search(r"\{[\s\S]*\}", text)
+        if brace_match:
+            candidates.append(brace_match.group(0).strip())
+
+        seen: set[str] = set()
+        for cand in candidates:
+            if not cand or cand in seen:
+                continue
+            seen.add(cand)
+            try:
+                obj = json.loads(cand)
+                if isinstance(obj, dict):
+                    return obj
+            except Exception:
+                continue
+        return None
+
+    def _extract_single_code_block(self, raw: str) -> str | None:
+        blocks = re.findall(r"```(?:[\w+-]+)?\s*\n?([\s\S]*?)\n?```", raw)
+        if len(blocks) != 1:
+            return None
+        body = blocks[0].strip("\n")
+        return body if body else None
 
     def _delete_file(self, action: ActionSpec) -> dict[str, Any]:
         path = str(action.input.get("path") or "")

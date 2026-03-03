@@ -1,5 +1,13 @@
 from fastapi import APIRouter, HTTPException
-from backend.models.schemas import FileItem, FileContent, CreateFileRequest, RenameRequest, DeleteRequest
+from backend.models.schemas import (
+    FileItem,
+    FileContent,
+    CreateFileRequest,
+    RenameRequest,
+    DeleteRequest,
+    WorkspaceInfo,
+    WorkspaceSwitchRequest,
+)
 from backend.services import file_service
 
 router = APIRouter(prefix="/api/files", tags=["files"])
@@ -11,6 +19,20 @@ async def get_file_tree(path: str = ""):
         return file_service.list_directory(path)
     except FileNotFoundError as e:
         raise HTTPException(status_code=404, detail=str(e))
+
+
+@router.get("/workspace", response_model=WorkspaceInfo)
+async def get_workspace_info():
+    return WorkspaceInfo(**file_service.get_workspace_info())
+
+
+@router.post("/workspace/switch", response_model=WorkspaceInfo)
+async def switch_workspace(req: WorkspaceSwitchRequest):
+    try:
+        root = file_service.set_workspace_root(req.path)
+        return WorkspaceInfo(workspace_root=root)
+    except (FileNotFoundError, ValueError) as e:
+        raise HTTPException(status_code=400, detail=str(e))
 
 
 @router.get("/read", response_model=FileContent)

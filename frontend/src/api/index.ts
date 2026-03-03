@@ -164,6 +164,7 @@ export interface PlanRunStepInfo {
 
 export interface ExecutionEvent {
   event_id: string;
+  run_id?: string;
   sequence?: number;
   kind?: string;
   stage: string;
@@ -248,6 +249,10 @@ export interface TerminalSessionResizeRequest {
   rows: number;
 }
 
+export interface WorkspaceInfo {
+  workspace_root: string;
+}
+
 async function request<T>(url: string, options?: RequestInit): Promise<T> {
   const resp = await fetch(`${BASE}${url}`, {
     headers: { 'Content-Type': 'application/json' },
@@ -261,6 +266,15 @@ async function request<T>(url: string, options?: RequestInit): Promise<T> {
 }
 
 export const api = {
+  getWorkspaceInfo: () =>
+    request<WorkspaceInfo>('/files/workspace'),
+
+  switchWorkspace: (path: string) =>
+    request<WorkspaceInfo>('/files/workspace/switch', {
+      method: 'POST',
+      body: JSON.stringify({ path }),
+    }),
+
   getFileTree: (path = '') =>
     request<FileItem[]>(`/files/tree?path=${encodeURIComponent(path)}`),
 

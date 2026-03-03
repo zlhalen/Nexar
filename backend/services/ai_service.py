@@ -177,6 +177,9 @@ PLANNER_SYSTEM_PROMPT = """你是 Nexar 的动作规划器（Planner）。
 10) 如果提供了 conversation_summary，应先结合该摘要再阅读 conversation_history。
 11) 对 run_command 类动作，必须优先使用非交互命令（避免需要人工选择/确认）；若可能触发交互，请先 ask_user 确认执行方案。
 12) 当前阶段目标是“规划与写代码”，禁止输出环境安装/初始化类命令（如 npm/pnpm/yarn install、pip install、create-vite、tailwindcss init 等）；此类步骤留给用户在代码完成后手动执行。
+13) search_code 的 input 字段只允许：query, root, paths, regex, limit。禁止输出 patterns/include/file_glob/max_results/case_sensitive 等其他字段。
+14) run_command/run_tests/run_lint/run_build 的 input 字段只允许：command, cwd。cwd 必须是相对 workspace_root 的路径（如 frontend、backend）或 workspace 内绝对路径。禁止输出 working_directory/workdir/dir/path 等别名字段。
+15) 当 run_command 需要执行 Python 代码片段（尤其包含 async def、多行逻辑、try/except）时，禁止使用 `python -c "..."` 单行拼接；必须使用 `python3 - <<'PY' ... PY` heredoc 多行脚本格式。
 
 输出格式：
 {
@@ -425,7 +428,13 @@ def _parse_ai_response(raw: str, action: str) -> AIResponse:
     if stripped.startswith("{") and stripped.endswith("}"):
         try:
             data = json.loads(stripped)
-            if isinstance(data, dict) and "action" in data:
+            if isinstance(data, dict) and (
+                "action" in data
+                or "file_content" in data
+                or "changes" in data
+                or "file_path" in data
+                or "plan" in data
+            ):
                 return _parse_ai_response(f"```json\n{stripped}\n```", action)
         except json.JSONDecodeError:
             pass
@@ -434,23 +443,130 @@ def _parse_ai_response(raw: str, action: str) -> AIResponse:
     return AIResponse(content=raw, action=fallback_action)
 
 
+def _find_balanced_json_objects(text: str) -> list[str]:
+    candidates: list[str] = []
+    start = -1
+    depth = 0
+    in_str = False
+    escape = False
+    for i, ch in enumerate(text):
+        if in_str:
+            if escape:
+                escape = False
+            elif ch == "\\":
+                escape = True
+            elif ch == '"':
+                in_str = False
+            continue
+        if ch == '"':
+            in_str = True
+            continue
+        if ch == "{":
+            if depth == 0:
+                start = i
+            depth += 1
+            continue
+        if ch == "}":
+            if depth == 0:
+                continue
+            depth -= 1
+            if depth == 0 and start >= 0:
+                candidates.append(text[start:i + 1])
+                start = -1
+    return candidates
+
+
 def _extract_json_payload(raw: str) -> dict:
-    json_match = re.search(r'```json\s*\n?(.*?)\n?\s*```', raw, re.DOTALL)
-    if json_match:
-        return json.loads(json_match.group(1))
+    text = (raw or "").strip().replace("\ufeff", "")
+    if not text:
+        raise ValueError("planner output is empty")
 
-    text = raw.strip()
-    if text.startswith("{") and text.endswith("}"):
-        return json.loads(text)
+    candidates: list[str] = []
+    # 优先 json code fence
+    for match in re.finditer(r"```json\s*([\s\S]*?)\s*```", text, re.IGNORECASE):
+        candidates.append(match.group(1))
+    # 其次任意 code fence
+    for match in re.finditer(r"```[\w-]*\s*([\s\S]*?)\s*```", text):
+        candidates.append(match.group(1))
+    # 整体文本
+    candidates.append(text)
+    # 以及文本内平衡的大括号对象
+    candidates.extend(_find_balanced_json_objects(text))
 
-    obj_match = re.search(r"\{[\s\S]*\}", raw, re.DOTALL)
-    if obj_match:
-        return json.loads(obj_match.group(0))
+    seen: set[str] = set()
+    normalized_candidates: list[str] = []
+    for cand in candidates:
+        s = (cand or "").strip()
+        if not s or s in seen:
+            continue
+        seen.add(s)
+        normalized_candidates.append(s)
+
+    for cand in normalized_candidates:
+        attempts = [
+            cand,
+            re.sub(r",\s*([}\]])", r"\1", cand),  # 去掉尾逗号
+        ]
+        for attempt in attempts:
+            try:
+                payload = json.loads(attempt)
+                if isinstance(payload, dict):
+                    return payload
+            except Exception:
+                continue
     raise ValueError("planner output is not valid JSON")
 
 
 def _parse_action_batch_response(raw: str, iteration: int) -> ActionBatch:
     payload = _extract_json_payload(raw)
+    if not isinstance(payload, dict):
+        raise ValueError("planner payload must be object")
+
+    payload.setdefault("version", "1.0")
+    payload.setdefault("actions", [])
+    payload.setdefault("acceptance", [])
+    payload.setdefault("risks", [])
+    payload.setdefault("next_questions", [])
+
+    decision = payload.get("decision")
+    if isinstance(decision, str):
+        payload["decision"] = {
+            "mode": decision,
+            "needs_user_trigger": True,
+        }
+    elif isinstance(decision, dict):
+        decision.setdefault("needs_user_trigger", True)
+    else:
+        payload["decision"] = {
+            "mode": "ask_user",
+            "reason": "missing_decision",
+            "needs_user_trigger": True,
+        }
+
+    actions = payload.get("actions")
+    if isinstance(actions, list):
+        normalized_actions = []
+        for idx, act in enumerate(actions):
+            if not isinstance(act, dict):
+                continue
+            act = dict(act)
+            act.setdefault("id", f"a{idx + 1}")
+            act.setdefault("title", act.get("type", "未命名动作"))
+            act.setdefault("reason", "planner_output_normalized")
+            act.setdefault("input", {})
+            act.setdefault("response", {})
+            act.setdefault("depends_on", [])
+            act.setdefault("can_parallel", False)
+            act.setdefault("priority", 3)
+            act.setdefault("timeout_sec", 120)
+            act.setdefault("max_retries", 1)
+            act.setdefault("success_criteria", ["动作可执行并产出结果"])
+            act.setdefault("artifacts", [])
+            normalized_actions.append(act)
+        payload["actions"] = normalized_actions
+    else:
+        payload["actions"] = []
+
     payload["iteration"] = iteration
     batch = ActionBatch.model_validate(payload)
     return batch
@@ -643,13 +759,17 @@ async def call_claude(messages: list[dict]) -> tuple[str, dict]:
 
 async def call_custom(messages: list[dict]) -> tuple[str, dict]:
     """OpenAI-compatible custom endpoint."""
+    import asyncio
     import httpx
     import time
-    base_url = os.getenv("CUSTOM_BASE_URL", "")
+    base_url = os.getenv("CUSTOM_BASE_URL", "").strip()
     api_key = os.getenv("CUSTOM_API_KEY", "")
-    model = os.getenv("CUSTOM_MODEL", "")
+    model = os.getenv("CUSTOM_MODEL", "").strip()
     if not base_url:
         raise ValueError("CUSTOM_BASE_URL 未配置，请在 backend/.env 文件中设置")
+    if not model:
+        raise ValueError("CUSTOM_MODEL 未配置，请在 backend/.env 文件中设置")
+    base_url = base_url.rstrip("/")
 
     headers = {"Content-Type": "application/json"}
     if api_key:
@@ -658,17 +778,106 @@ async def call_custom(messages: list[dict]) -> tuple[str, dict]:
         headers["HTTP-Referer"] = "http://localhost:3000"
         headers["X-Title"] = "Nexar Code"
 
+    def _extract_error_message(resp: httpx.Response) -> str:
+        try:
+            error_data = resp.json()
+            error_detail = error_data.get("error", {})
+            if isinstance(error_detail, dict):
+                msg = error_detail.get("message", "")
+                if msg:
+                    return str(msg)
+            if error_detail:
+                return str(error_detail)
+        except Exception:
+            pass
+        text = (resp.text or "").strip()
+        return text if text else f"HTTP {resp.status_code}"
+
+    def _extract_text_from_response(data: dict) -> str:
+        choices = data.get("choices")
+        if not isinstance(choices, list) or not choices:
+            raise ValueError("返回格式异常：缺少 choices 字段")
+        message = choices[0].get("message", {})
+        content = message.get("content")
+        if isinstance(content, str):
+            return content
+        if isinstance(content, list):
+            parts: list[str] = []
+            for item in content:
+                if isinstance(item, dict):
+                    txt = item.get("text") or item.get("content")
+                    if isinstance(txt, str) and txt.strip():
+                        parts.append(txt)
+            if parts:
+                return "\n".join(parts)
+        raise ValueError("返回格式异常：message.content 为空或非文本")
+
+    request_payloads = [
+        # 标准 OpenAI 兼容参数（多数模型可用）
+        {"model": model, "messages": messages, "temperature": 0.3, "max_tokens": 40000},
+        # thinking/reasoning 模型常见兼容写法
+        {"model": model, "messages": messages, "max_completion_tokens": 40000},
+        # 最小参数兜底
+        {"model": model, "messages": messages},
+    ]
+
+    endpoint_url = f"{base_url}/chat/completions"
     t0 = time.monotonic()
     try:
+        data = None
+        result = ""
+        last_retry_error: str | None = None
+        last_request_error: httpx.RequestError | None = None
         async with httpx.AsyncClient(timeout=120) as client:
-            resp = await client.post(
-                f"{base_url}/chat/completions",
-                headers=headers,
-                json={"model": model, "messages": messages, "temperature": 0.3, "max_tokens": 8192},
-            )
-            resp.raise_for_status()
-            data = resp.json()
-            result = data["choices"][0]["message"]["content"]
+            for idx, payload in enumerate(request_payloads):
+                resp = None
+                for retry_idx in range(3):
+                    try:
+                        resp = await client.post(endpoint_url, headers=headers, json=payload)
+                        break
+                    except httpx.RequestError as req_err:
+                        last_request_error = req_err
+                        if retry_idx >= 2:
+                            raise
+                        # 短暂网络抖动时做指数退避，避免一次失败就中断。
+                        await asyncio.sleep(0.8 * (2**retry_idx))
+
+                if resp is None:
+                    if last_request_error is not None:
+                        raise last_request_error
+                    raise ValueError("调用自定义 API 时未收到有效响应")
+                if resp.status_code >= 400:
+                    err_text = _extract_error_message(resp)
+                    can_retry = (
+                        resp.status_code == 400
+                        and idx < len(request_payloads) - 1
+                        and any(
+                            token in err_text.lower()
+                            for token in [
+                                "unsupported",
+                                "not supported",
+                                "invalid",
+                                "max_tokens",
+                                "max_completion_tokens",
+                                "temperature",
+                                "reasoning",
+                                "thinking",
+                            ]
+                        )
+                    )
+                    if can_retry:
+                        last_retry_error = err_text
+                        continue
+                    resp.raise_for_status()
+                data = resp.json()
+                result = _extract_text_from_response(data)
+                break
+
+        if data is None:
+            if last_retry_error:
+                raise ValueError(f"模型参数不兼容: {last_retry_error}")
+            raise ValueError("调用自定义 API 时未收到有效响应")
+
         elapsed_ms = int((time.monotonic() - t0) * 1000)
         usage = data.get("usage", {}) if isinstance(data, dict) else {}
         input_tokens = usage.get("prompt_tokens") if isinstance(usage, dict) else None
@@ -686,15 +895,7 @@ async def call_custom(messages: list[dict]) -> tuple[str, dict]:
         return result, llm_call
     except httpx.HTTPStatusError as e:
         status_code = e.response.status_code
-        try:
-            error_data = e.response.json()
-            error_detail = error_data.get("error", {})
-            if isinstance(error_detail, dict):
-                error_message = error_detail.get("message", str(e))
-            else:
-                error_message = str(error_detail) if error_detail else str(e)
-        except:
-            error_message = str(e)
+        error_message = _extract_error_message(e.response)
         
         if status_code == 401:
             if "openrouter.ai" in base_url:
@@ -706,12 +907,38 @@ async def call_custom(messages: list[dict]) -> tuple[str, dict]:
                 error_msg = f"API 认证失败 (401): {error_message}。请检查 backend/.env 中的 CUSTOM_API_KEY 配置"
         elif status_code == 404:
             error_msg = f"API 端点不存在 (404): 请检查 backend/.env 中的 CUSTOM_BASE_URL 配置"
+        elif status_code == 400:
+            error_msg = (
+                f"API 参数不兼容 (400): {error_message}。"
+                "这通常是模型参数与接口不匹配（常见于 thinking/reasoning 模型）。"
+            )
         else:
             error_msg = f"API 请求失败 ({status_code}): {error_message}"
         _log_interaction("custom", model, messages, "", int((time.monotonic() - t0) * 1000), error=error_msg)
         raise ValueError(error_msg) from e
     except httpx.RequestError as e:
-        error_msg = f"无法连接到 API 服务器: {str(e)}。请检查 backend/.env 中的 CUSTOM_BASE_URL 配置"
+        detail = str(e).strip()
+        if not detail:
+            root_cause = getattr(e, "__cause__", None)
+            detail = str(root_cause).strip() if root_cause else ""
+        if not detail:
+            detail = repr(e)
+
+        request_url = ""
+        try:
+            request_url = str(e.request.url) if e.request else endpoint_url
+        except Exception:
+            request_url = endpoint_url
+
+        openrouter_hint = ""
+        if "openrouter.ai" in base_url:
+            openrouter_hint = "；若你在中国大陆网络环境，通常还需要可用代理/VPN 才能访问 openrouter.ai"
+
+        error_msg = (
+            f"无法连接到 API 服务器: {detail}（URL: {request_url}）。"
+            "请检查 backend/.env 中的 CUSTOM_BASE_URL 配置与网络连通性"
+            f"{openrouter_hint}"
+        )
         _log_interaction("custom", model, messages, "", int((time.monotonic() - t0) * 1000), error=error_msg)
         raise ValueError(error_msg) from e
     except Exception as e:
@@ -809,7 +1036,11 @@ async def plan_actions(
         batch = _parse_action_batch_response(raw, iteration=iteration)
         batch.llm_call = llm_call
         return batch
-    except Exception:
+    except Exception as e:
+        preview = (raw or "").strip().replace("\n", "\\n")
+        if len(preview) > 800:
+            preview = preview[:800] + "...(truncated)"
+        logger.warning("[planner_parse_failed] provider=%s iteration=%s error=%s raw=%s", provider.value, iteration, str(e), preview)
         # Safe fallback so orchestrator can continue with user-visible guidance.
         return ActionBatch(
             version="1.0",

@@ -8,8 +8,10 @@ import type { FileItem } from '../api';
 interface Props {
   files: FileItem[];
   activeFile: string | null;
+  workspaceRoot?: string;
   onFileSelect: (path: string) => void;
   onRefresh: () => void;
+  onSwitchWorkspace: (path: string) => void;
   onCreate: (path: string, isDir: boolean) => void;
   onDelete: (path: string) => void;
   onRename: (oldPath: string, newPath: string) => void;
@@ -132,7 +134,17 @@ function TreeNode({ item, depth, activeFile, onFileSelect, onDelete, onRename }:
   );
 }
 
-export default function FileTree({ files, activeFile, onFileSelect, onRefresh, onCreate, onDelete, onRename }: Props) {
+export default function FileTree({
+  files,
+  activeFile,
+  workspaceRoot,
+  onFileSelect,
+  onRefresh,
+  onSwitchWorkspace,
+  onCreate,
+  onDelete,
+  onRename,
+}: Props) {
   const [showInput, setShowInput] = useState<'file' | 'dir' | null>(null);
   const [inputValue, setInputValue] = useState('');
 
@@ -147,8 +159,21 @@ export default function FileTree({ files, activeFile, onFileSelect, onRefresh, o
   return (
     <div className="h-full flex flex-col bg-sidebar-bg">
       <div className="flex items-center justify-between px-3 py-2 border-b border-border-color">
-        <span className="text-xs font-semibold text-text-secondary uppercase tracking-wider">资源管理器</span>
+        <span className="text-xs font-semibold text-text-secondary uppercase tracking-wider truncate" title={workspaceRoot || ''}>
+          资源管理器
+        </span>
         <div className="flex items-center gap-1">
+          <button
+            onClick={() => {
+              const current = workspaceRoot || '';
+              const target = prompt('输入新的工作目录绝对路径', current);
+              if (target && target.trim()) onSwitchWorkspace(target.trim());
+            }}
+            className="p-1 hover:bg-hover-bg rounded"
+            title="切换工作目录"
+          >
+            <FolderOpen size={14} className="text-text-secondary" />
+          </button>
           <button onClick={() => setShowInput('file')} className="p-1 hover:bg-hover-bg rounded" title="新建文件">
             <Plus size={14} className="text-text-secondary" />
           </button>

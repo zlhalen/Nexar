@@ -3,20 +3,62 @@ import shutil
 from pathlib import Path
 from backend.models.schemas import FileItem, FileContent
 
-WORKSPACE_ROOT = os.getenv("WORKSPACE_ROOT", os.path.join(os.path.dirname(__file__), "..", "..", "workspace"))
+_WORKSPACE_ROOT = os.path.abspath(
+    os.getenv("WORKSPACE_ROOT", os.path.join(os.path.dirname(__file__), "..", "..", "workspace"))
+)
+
+VISIBLE_DOTFILES = {
+    ".env",
+    ".envrc",
+    ".gitignore",
+    ".gitattributes",
+    ".editorconfig",
+    ".npmrc",
+    ".nvmrc",
+    ".yarnrc",
+    ".yarnrc.yml",
+    ".pnpmrc",
+    ".prettierrc",
+    ".prettierignore",
+    ".eslintrc",
+    ".eslintignore",
+    ".stylelintrc",
+    ".babelrc",
+    ".dockerignore",
+    ".python-version",
+    ".tool-versions",
+}
 
 
 def get_workspace_root() -> str:
-    root = os.path.abspath(WORKSPACE_ROOT)
+    root = os.path.abspath(_WORKSPACE_ROOT)
     os.makedirs(root, exist_ok=True)
     return root
+
+
+def set_workspace_root(path: str) -> str:
+    global _WORKSPACE_ROOT
+    if not path:
+        raise ValueError("workspace path is required")
+    new_root = os.path.abspath(path)
+    if not os.path.isdir(new_root):
+        raise FileNotFoundError(f"Directory not found: {path}")
+    _WORKSPACE_ROOT = new_root
+    return get_workspace_root()
+
+
+def get_workspace_info() -> dict[str, str]:
+    root = get_workspace_root()
+    return {"workspace_root": root}
 
 
 def _safe_path(relative_path: str) -> str:
     """Ensure path is within workspace to prevent directory traversal attacks."""
     root = get_workspace_root()
-    full = os.path.normpath(os.path.join(root, relative_path))
-    if not full.startswith(root):
+    full = os.path.abspath(os.path.normpath(os.path.join(root, relative_path)))
+    try:
+        Path(full).relative_to(Path(root))
+    except ValueError as e:
         raise ValueError("Path traversal detected")
     return full
 
@@ -40,6 +82,18 @@ def _get_language(filename: str) -> str:
     return ext_map.get(ext.lower(), "plaintext")
 
 
+def _should_include_hidden_entry(name: str, is_dir: bool) -> bool:
+    if not name.startswith("."):
+        return True
+    if is_dir:
+        return False
+    if name in VISIBLE_DOTFILES:
+        return True
+    if name.startswith(".env."):
+        return True
+    return False
+
+
 def list_directory(relative_path: str = "") -> list[FileItem]:
     full_path = _safe_path(relative_path)
     if not os.path.isdir(full_path):
@@ -52,11 +106,11 @@ def list_directory(relative_path: str = "") -> list[FileItem]:
         return items
 
     for entry in entries:
-        if entry.startswith("."):
-            continue
         entry_full = os.path.join(full_path, entry)
         entry_rel = os.path.join(relative_path, entry) if relative_path else entry
         is_dir = os.path.isdir(entry_full)
+        if not _should_include_hidden_entry(entry, is_dir):
+            continue
         item = FileItem(name=entry, path=entry_rel, is_dir=is_dir)
         if is_dir:
             item.children = list_directory(entry_rel)

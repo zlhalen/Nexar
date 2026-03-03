@@ -6,7 +6,7 @@ import {
 import ReactMarkdown from 'react-markdown';
 import { Prism as SyntaxHighlighter } from 'react-syntax-highlighter';
 import { oneDark } from 'react-syntax-highlighter/dist/esm/styles/prism';
-import type { ChatMessage, AIResponse, Provider, CodeSnippet, ExecutionEvent, ActionSpec } from '../api';
+import type { ChatMessage, AIResponse, Provider, CodeSnippet, ExecutionEvent, ActionSpec, FileChange } from '../api';
 
 interface Props {
   chatTabs: Array<{ id: string; title: string }>;
@@ -26,6 +26,8 @@ interface Props {
   activeFile: string | null;
   lastAIResult: AIResponse | null;
   executionEvents: ExecutionEvent[];
+  runChanges: Record<string, FileChange[]>;
+  revertedRuns: Record<string, boolean>;
   onApplyFile: (path: string, content: string) => void;
   onShowDiff?: (path: string, oldContent: string, newContent: string) => void;
   getCurrentFileContent?: (path: string) => string | undefined;
@@ -36,6 +38,7 @@ interface Props {
   onResumeRun: () => void;
   onCancelRun: () => void;
   onSubmitAskUserInput: (message: string) => Promise<void>;
+  onRevertRunChanges: (runId: string, changes: FileChange[]) => Promise<void> | void;
 }
 
 export default function ChatPanel({
@@ -43,8 +46,9 @@ export default function ChatPanel({
   draftSnippets, onDraftSnippetsChange,
   messages, loading, providers, currentProvider,
   onProviderChange, onSend, onClear, activeFile,
-  lastAIResult, executionEvents, onApplyFile, onShowDiff, getCurrentFileContent,
+  lastAIResult, executionEvents, runChanges, revertedRuns, onApplyFile, onShowDiff, getCurrentFileContent,
   runStatus, pendingActions, controlDisabled, onPauseRun, onResumeRun, onCancelRun, onSubmitAskUserInput,
+  onRevertRunChanges,
 }: Props) {
   const [input, setInput] = useState('');
   const [chatOnly, setChatOnly] = useState(false);
@@ -54,6 +58,7 @@ export default function ChatPanel({
   const [usageViewer, setUsageViewer] = useState<{ title: string; llm: any } | null>(null);
   const [askReplyDraft, setAskReplyDraft] = useState<Record<string, string>>({});
   const [askReplySubmitting, setAskReplySubmitting] = useState<string | null>(null);
+  const [revertingRunId, setRevertingRunId] = useState<string | null>(null);
   const scrollRef = useRef<HTMLDivElement>(null);
   const inputRef = useRef<HTMLTextAreaElement>(null);
   const modelMenuRef = useRef<HTMLDivElement>(null);
@@ -120,6 +125,8 @@ export default function ChatPanel({
   };
 
   const handleKeyDown = (e: React.KeyboardEvent) => {
+    const nativeEvt = e.nativeEvent as KeyboardEvent & { isComposing?: boolean; keyCode?: number };
+    if (nativeEvt.isComposing || nativeEvt.keyCode === 229) return;
     if (e.key === 'Enter' && !e.shiftKey) {
       e.preventDefault();
       handleSend();
@@ -128,20 +135,22 @@ export default function ChatPanel({
 
   const currentProviderInfo = providers.find(p => p.id === currentProvider);
   const sortedEvents = [...executionEvents].sort((a, b) => {
-    const sa = typeof a.sequence === 'number' ? a.sequence : Number.MAX_SAFE_INTEGER;
-    const sb = typeof b.sequence === 'number' ? b.sequence : Number.MAX_SAFE_INTEGER;
-    if (sa !== sb) return sa - sb;
     const ta = a.timestamp ? Date.parse(a.timestamp) : 0;
     const tb = b.timestamp ? Date.parse(b.timestamp) : 0;
     if (ta !== tb) return ta - tb;
+    const sa = typeof a.sequence === 'number' ? a.sequence : Number.MAX_SAFE_INTEGER;
+    const sb = typeof b.sequence === 'number' ? b.sequence : Number.MAX_SAFE_INTEGER;
+    if (sa !== sb) return sa - sb;
     return a.event_id.localeCompare(b.event_id);
   });
   const flowSections: Array<{ id: string; events: ExecutionEvent[] }> = [];
   let sectionBuffer: ExecutionEvent[] = [];
   let sectionHasRunStart = false;
+  let currentRunId: string | null = null;
   sortedEvents.forEach(evt => {
     const isTempPlanningStart = evt.stage === 'planning' && evt.status === 'running' && !!(evt.data as any)?.temporary;
     const isRunStart = evt.stage === 'run' && evt.title.includes('任务已创建');
+    const runChanged = !!evt.run_id && !!currentRunId && evt.run_id !== currentRunId;
     const runStartAfterTempPlaceholder = (
       isRunStart
       && !sectionHasRunStart
@@ -151,11 +160,11 @@ export default function ChatPanel({
       && !!(sectionBuffer[0].data as any)?.temporary
     );
     const shouldSplit = sectionBuffer.length > 0 && (
-      isTempPlanningStart || (isRunStart && sectionHasRunStart)
+      runChanged || isTempPlanningStart || (isRunStart && sectionHasRunStart)
     ) && !runStartAfterTempPlaceholder;
     if (shouldSplit) {
       flowSections.push({
-        id: `section-${sectionBuffer[0].event_id}`,
+        id: `section-${currentRunId || sectionBuffer[0].event_id}`,
         events: sectionBuffer,
       });
       sectionBuffer = [];
@@ -163,11 +172,13 @@ export default function ChatPanel({
     }
 
     sectionBuffer.push(evt);
+    if (!currentRunId && evt.run_id) currentRunId = evt.run_id;
+    if (runChanged) currentRunId = evt.run_id || null;
     if (isRunStart) sectionHasRunStart = true;
   });
   if (sectionBuffer.length > 0) {
     flowSections.push({
-      id: `section-${sectionBuffer[0].event_id}`,
+      id: `section-${currentRunId || sectionBuffer[0].event_id}`,
       events: sectionBuffer,
     });
   }
@@ -190,9 +201,10 @@ export default function ChatPanel({
 
     const grouped = new Map<string, ExecutionEvent[]>();
     filteredEvents.forEach(evt => {
+      const runKey = evt.run_id || 'legacy';
       const key = evt.action_id
-        ? `a:${evt.iteration || 0}:${evt.action_id}`
-        : `s:${evt.iteration || 0}:${evt.kind || 'system'}:${evt.stage}`;
+        ? `a:${runKey}:${evt.iteration || 0}:${evt.action_id}`
+        : `s:${runKey}:${evt.iteration || 0}:${evt.kind || 'system'}:${evt.stage}`;
       const list = grouped.get(key) || [];
       list.push(evt);
       grouped.set(key, list);
@@ -249,19 +261,7 @@ export default function ChatPanel({
       detail: evt.detail || '',
     };
   };
-  const modifiedChanges = (() => {
-    const fromChanges = (lastAIResult?.changes || []).filter(ch => ch.write_result === 'written');
-    if (fromChanges.length > 0) return fromChanges;
-    if (lastAIResult?.file_path && lastAIResult?.file_content) {
-      return [{
-        file_path: lastAIResult.file_path,
-        file_content: lastAIResult.file_content,
-        after_content: lastAIResult.file_content,
-        write_result: 'written',
-      }];
-    }
-    return [];
-  })();
+  const latestRunId = lastAIResult?.run_id || lastAIResult?.run?.run_id;
 
   const EventIcon = ({ status }: { status: string }) => {
     if (status === 'completed') return <CheckCircle2 size={13} className="text-success mt-0.5" />;
@@ -525,6 +525,16 @@ export default function ChatPanel({
   const renderFlowSection = (section: { id: string; events: ExecutionEvent[] }, sectionIdx: number) => {
     const visibleEvents = getVisibleEvents(section.events);
     const isLatest = sectionIdx === flowSections.length - 1;
+    const sectionRunId = section.events.find(evt => typeof evt.run_id === 'string' && evt.run_id)?.run_id || '';
+    const fallbackChanges = (
+      sectionRunId
+      && latestRunId === sectionRunId
+      && Array.isArray(lastAIResult?.changes)
+    ) ? lastAIResult.changes.filter(ch => ch.write_result === 'written') : [];
+    const sectionChanges = sectionRunId
+      ? (runChanges[sectionRunId] || fallbackChanges)
+      : [];
+    const isReverted = sectionRunId ? !!revertedRuns[sectionRunId] : false;
     const finalActionEvent = [...section.events].reverse().find(
       evt => evt.stage === 'final_answer' && typeof (evt.output as any)?.content === 'string' && String((evt.output as any).content).trim().length > 0
     );
@@ -541,7 +551,14 @@ export default function ChatPanel({
       <div key={section.id} className="space-y-2">
         <div className="bg-sidebar-bg border border-[#3f4c63] rounded-lg p-3">
           <div className="flex items-center justify-between gap-2 mb-2">
-            <div className="text-[11px] text-[#9ec6ff]">执行流程</div>
+            <div className="flex items-center gap-2">
+              <div className="text-[11px] text-[#9ec6ff]">执行流程</div>
+              {isReverted && (
+                <span className="text-[10px] px-1.5 py-0.5 rounded border border-[#3a7a56] text-[#8de1ad]">
+                  已撤销
+                </span>
+              )}
+            </div>
             <div className="flex items-center gap-1">
               {isLatest && runStatus === 'running' && (
                 <button
@@ -696,11 +713,30 @@ export default function ChatPanel({
               </div>
             ))}
           </div>
-          {modifiedChanges.length > 0 && (
+          {sectionChanges.length > 0 && (
             <div className="mt-3 pt-2 border-t border-[#3f4c63]">
-              <div className="text-[11px] text-[#9ec6ff] mb-1">代码修改文件</div>
+              <div className="flex items-center justify-between gap-2 mb-1">
+                <div className="text-[11px] text-[#9ec6ff]">代码修改文件</div>
+                <div className="flex items-center gap-2">
+                  <button
+                    className="inline-flex items-center gap-1 text-[10px] px-1.5 py-0.5 rounded border border-border-color text-[#9ec6ff] hover:bg-hover-bg disabled:opacity-60"
+                    disabled={!sectionRunId || isReverted || revertingRunId === sectionRunId || controlDisabled}
+                    onClick={async () => {
+                      if (!sectionRunId || isReverted || revertingRunId) return;
+                      setRevertingRunId(sectionRunId);
+                      try {
+                        await onRevertRunChanges(sectionRunId, sectionChanges);
+                      } finally {
+                        setRevertingRunId(null);
+                      }
+                    }}
+                  >
+                    {revertingRunId === sectionRunId ? '撤销中...' : '撤销本次修改'}
+                  </button>
+                </div>
+              </div>
               <div className="space-y-1">
-                {modifiedChanges.map((ch, idx) => (
+                {sectionChanges.map((ch, idx) => (
                   <div key={`${ch.file_path}-${idx}`} className="flex items-center justify-between gap-2">
                     <div className="text-[11px] text-text-secondary truncate">{ch.file_path}</div>
                     <button

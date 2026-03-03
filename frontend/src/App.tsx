@@ -11,7 +11,7 @@ import TerminalPanel from './components/TerminalPanel';
 import SettingsPage from './components/SettingsPage';
 import { api } from './api';
 import type {
-  FileItem, ChatMessage, AIResponse, Provider, CodeSnippet, ExecutionEvent, ActionSpec, HistoryConfig,
+  FileItem, ChatMessage, AIResponse, Provider, CodeSnippet, ExecutionEvent, ActionSpec, HistoryConfig, FileChange,
 } from './api';
 
 interface OpenFile {
@@ -37,6 +37,8 @@ interface ChatSession {
   needsUserTrigger: boolean;
   pendingActions: ActionSpec[];
   runStatus?: string;
+  runChanges: Record<string, FileChange[]>;
+  revertedRuns: Record<string, boolean>;
 }
 
 function createChatSession(index: number): ChatSession {
@@ -51,6 +53,8 @@ function createChatSession(index: number): ChatSession {
     needsUserTrigger: false,
     pendingActions: [],
     runStatus: undefined,
+    runChanges: {},
+    revertedRuns: {},
   };
 }
 
@@ -64,13 +68,18 @@ function mergeSnippets(prev: CodeSnippet[], incoming: CodeSnippet[]): CodeSnippe
   return merged;
 }
 
-function mergeExecutionEvents(prev: ExecutionEvent[], incoming: ExecutionEvent[]): ExecutionEvent[] {
+function mergeExecutionEvents(prev: ExecutionEvent[], incoming: ExecutionEvent[], runId?: string): ExecutionEvent[] {
   if (!incoming || incoming.length === 0) return prev;
-  if (!prev || prev.length === 0) return incoming.slice();
+  const normalizedIncoming = incoming.map(evt => (
+    evt.run_id || !runId
+      ? evt
+      : { ...evt, run_id: runId }
+  ));
+  if (!prev || prev.length === 0) return normalizedIncoming.slice();
   const byId = new Map<string, ExecutionEvent>();
   for (const evt of prev) byId.set(evt.event_id, evt);
-  for (const evt of incoming) byId.set(evt.event_id, evt);
-  const incomingHasRealEvents = incoming.some(
+  for (const evt of normalizedIncoming) byId.set(evt.event_id, evt);
+  const incomingHasRealEvents = normalizedIncoming.some(
     evt => !(evt.stage === 'planning' && evt.status === 'running' && !!(evt.data as any)?.temporary)
   );
   const merged = Array.from(byId.values()).filter(evt => (
@@ -85,6 +94,15 @@ function mergeExecutionEvents(prev: ExecutionEvent[], incoming: ExecutionEvent[]
     if (ta !== tb) return ta - tb;
     return a.event_id.localeCompare(b.event_id);
   });
+}
+
+function getWrittenChanges(changes?: FileChange[]): FileChange[] {
+  if (!changes || changes.length === 0) return [];
+  return changes.filter(ch => ch.write_result === 'written');
+}
+
+function clearTemporaryPlanningEvents(events: ExecutionEvent[]): ExecutionEvent[] {
+  return events.filter(evt => !(evt.stage === 'planning' && evt.status === 'running' && !!(evt.data as any)?.temporary));
 }
 
 function getDefaultChatWidth(): number {
@@ -130,6 +148,7 @@ export default function App() {
   const [currentProvider, setCurrentProvider] = useState('openai');
   const [historyConfig, setHistoryConfig] = useState<HistoryConfig>(DEFAULT_HISTORY_CONFIG);
   const [statusMsg, setStatusMsg] = useState('');
+  const [workspaceRoot, setWorkspaceRoot] = useState('');
   const [showDiff, setShowDiff] = useState(false);
   const [showSettingsPage, setShowSettingsPage] = useState(false);
   const [diffData, setDiffData] = useState<{
@@ -140,6 +159,8 @@ export default function App() {
   } | null>(null);
   const openFilesRef = useRef<OpenFile[]>([]);
   const autoSaveTimersRef = useRef<Record<string, number>>({});
+  const autoSaveRetryCountRef = useRef<Record<string, number>>({});
+  const unsavedContentRef = useRef<Record<string, string>>({});
   const runPollersRef = useRef<Record<string, boolean>>({});
   const runDriversRef = useRef<Record<string, boolean>>({});
 
@@ -157,6 +178,15 @@ export default function App() {
     }
   }, [showStatus]);
 
+  const loadWorkspaceInfo = useCallback(async () => {
+    try {
+      const info = await api.getWorkspaceInfo();
+      setWorkspaceRoot(info.workspace_root);
+    } catch (e: any) {
+      showStatus(`加载工作目录失败: ${e.message}`);
+    }
+  }, [showStatus]);
+
   const loadProviders = useCallback(async () => {
     try {
       const list = await api.getProviders();
@@ -169,8 +199,9 @@ export default function App() {
 
   useEffect(() => {
     loadFileTree();
+    loadWorkspaceInfo();
     loadProviders();
-  }, [loadFileTree, loadProviders]);
+  }, [loadFileTree, loadWorkspaceInfo, loadProviders]);
 
   useEffect(() => {
     try {
@@ -205,6 +236,18 @@ export default function App() {
   useEffect(() => {
     openFilesRef.current = openFiles;
   }, [openFiles]);
+
+  useEffect(() => {
+    const handler = (e: BeforeUnloadEvent) => {
+      const hasUnsaved = Object.keys(unsavedContentRef.current).length > 0
+        || openFilesRef.current.some(f => f.modified);
+      if (!hasUnsaved) return;
+      e.preventDefault();
+      e.returnValue = '';
+    };
+    window.addEventListener('beforeunload', handler);
+    return () => window.removeEventListener('beforeunload', handler);
+  }, []);
 
   useEffect(() => () => {
     Object.values(autoSaveTimersRef.current).forEach(id => window.clearTimeout(id));
@@ -302,64 +345,98 @@ export default function App() {
     }
   }, [openFiles, showStatus]);
 
-  const flushAutoSave = useCallback(async (path: string) => {
-    const file = openFilesRef.current.find(f => f.path === path);
-    if (!file || !file.modified) return;
-    try {
-      await api.writeFile(path, file.content);
-    } catch (e: any) {
-      showStatus(`自动保存失败: ${e.message}`);
-    }
-  }, [showStatus]);
-
-  const scheduleAutoSave = useCallback((path: string, content: string) => {
+  const clearAutoSaveTimer = useCallback((path: string) => {
     const oldTimer = autoSaveTimersRef.current[path];
     if (oldTimer) {
       window.clearTimeout(oldTimer);
       delete autoSaveTimersRef.current[path];
     }
-    autoSaveTimersRef.current[path] = window.setTimeout(async () => {
-      try {
-        await api.writeFile(path, content);
-        setOpenFiles(prev => prev.map(f => (
-          f.path === path && f.content === content
-            ? { ...f, modified: false }
-            : f
-        )));
-      } catch (e: any) {
-        showStatus(`自动保存失败: ${e.message}`);
-      } finally {
-        delete autoSaveTimersRef.current[path];
+  }, []);
+
+  const flushAutoSave = useCallback(async (path: string, allowRetry = true): Promise<boolean> => {
+    const queued = unsavedContentRef.current[path];
+    const file = openFilesRef.current.find(f => f.path === path);
+    const payload = typeof queued === 'string' ? queued : (file?.modified ? file.content : undefined);
+    if (payload === undefined) {
+      autoSaveRetryCountRef.current[path] = 0;
+      return true;
+    }
+
+    try {
+      await api.writeFile(path, payload);
+      if (unsavedContentRef.current[path] === payload) {
+        delete unsavedContentRef.current[path];
       }
-    }, 600);
-  }, [showStatus]);
+      autoSaveRetryCountRef.current[path] = 0;
+      setOpenFiles(prev => prev.map(f => (
+        f.path === path && f.content === payload
+          ? { ...f, modified: false }
+          : f
+      )));
+      return true;
+    } catch (e: any) {
+      if (allowRetry) {
+        const retries = (autoSaveRetryCountRef.current[path] || 0) + 1;
+        autoSaveRetryCountRef.current[path] = retries;
+        const delay = Math.min(5000, 600 * (2 ** Math.min(5, retries - 1)));
+        clearAutoSaveTimer(path);
+        autoSaveTimersRef.current[path] = window.setTimeout(() => {
+          void flushAutoSave(path, true);
+        }, delay);
+        showStatus(`自动保存失败，将重试: ${e.message}`, 2500);
+      } else {
+        showStatus(`自动保存失败: ${e.message}`);
+      }
+      return false;
+    }
+  }, [clearAutoSaveTimer, showStatus]);
+
+  const scheduleAutoSave = useCallback((path: string, delay = 600) => {
+    clearAutoSaveTimer(path);
+    autoSaveTimersRef.current[path] = window.setTimeout(() => {
+      void flushAutoSave(path, true);
+    }, delay);
+  }, [clearAutoSaveTimer, flushAutoSave]);
+
+  const flushAllPendingSaves = useCallback(async () => {
+    const fromUnsaved = Object.keys(unsavedContentRef.current);
+    const fromModified = openFilesRef.current.filter(f => f.modified).map(f => f.path);
+    const paths = Array.from(new Set([...fromUnsaved, ...fromModified]));
+    if (paths.length === 0) return;
+    await Promise.all(paths.map(async (p) => {
+      clearAutoSaveTimer(p);
+      await flushAutoSave(p, false);
+    }));
+  }, [clearAutoSaveTimer, flushAutoSave]);
 
   const closeFile = useCallback((path: string) => {
-    const oldTimer = autoSaveTimersRef.current[path];
-    if (oldTimer) {
-      window.clearTimeout(oldTimer);
-      delete autoSaveTimersRef.current[path];
-    }
-    void flushAutoSave(path);
+    clearAutoSaveTimer(path);
+    void flushAutoSave(path, true);
     setOpenFiles(prev => prev.filter(f => f.path !== path));
     if (activeFile === path) {
       const remaining = openFiles.filter(f => f.path !== path);
       setActiveFile(remaining.length > 0 ? remaining[remaining.length - 1].path : null);
     }
-  }, [openFiles, activeFile, flushAutoSave]);
+  }, [openFiles, activeFile, clearAutoSaveTimer, flushAutoSave]);
 
   const updateContent = useCallback((path: string, content: string) => {
+    unsavedContentRef.current[path] = content;
     setOpenFiles(prev => prev.map(f =>
       f.path === path ? { ...f, content, modified: true } : f
     ));
-    scheduleAutoSave(path, content);
+    scheduleAutoSave(path, 600);
   }, [scheduleAutoSave]);
 
   const saveFile = useCallback(async (path: string) => {
     const file = openFiles.find(f => f.path === path);
     if (!file) return;
     try {
+      clearAutoSaveTimer(path);
       await api.writeFile(path, file.content);
+      if (unsavedContentRef.current[path] === file.content) {
+        delete unsavedContentRef.current[path];
+      }
+      autoSaveRetryCountRef.current[path] = 0;
       setOpenFiles(prev => prev.map(f =>
         f.path === path ? { ...f, modified: false } : f
       ));
@@ -367,7 +444,7 @@ export default function App() {
     } catch (e: any) {
       showStatus(`保存失败: ${e.message}`);
     }
-  }, [openFiles, showStatus]);
+  }, [openFiles, clearAutoSaveTimer, showStatus]);
 
   const createItem = useCallback(async (path: string, isDir: boolean) => {
     try {
@@ -386,6 +463,8 @@ export default function App() {
         if (key === path || key.startsWith(`${path}/`)) {
           window.clearTimeout(autoSaveTimersRef.current[key]);
           delete autoSaveTimersRef.current[key];
+          delete unsavedContentRef.current[key];
+          delete autoSaveRetryCountRef.current[key];
         }
       });
       await api.deleteItem(path);
@@ -408,6 +487,14 @@ export default function App() {
         window.clearTimeout(oldTimer);
         delete autoSaveTimersRef.current[oldPath];
       }
+      if (typeof unsavedContentRef.current[oldPath] === 'string') {
+        unsavedContentRef.current[newPath] = unsavedContentRef.current[oldPath];
+        delete unsavedContentRef.current[oldPath];
+      }
+      if (typeof autoSaveRetryCountRef.current[oldPath] === 'number') {
+        autoSaveRetryCountRef.current[newPath] = autoSaveRetryCountRef.current[oldPath];
+        delete autoSaveRetryCountRef.current[oldPath];
+      }
       await api.renameItem(oldPath, newPath);
       setOpenFiles(prev => prev.map(f =>
         f.path === oldPath ? { ...f, path: newPath } : f
@@ -419,6 +506,37 @@ export default function App() {
       showStatus(`重命名失败: ${e.message}`);
     }
   }, [loadFileTree, activeFile, showStatus]);
+
+  const switchWorkspace = useCallback(async (path: string) => {
+    try {
+      await flushAllPendingSaves();
+      const info = await api.switchWorkspace(path);
+      setWorkspaceRoot(info.workspace_root);
+
+      Object.values(autoSaveTimersRef.current).forEach(id => window.clearTimeout(id));
+      autoSaveTimersRef.current = {};
+      unsavedContentRef.current = {};
+      autoSaveRetryCountRef.current = {};
+      Object.keys(runPollersRef.current).forEach(key => { runPollersRef.current[key] = false; });
+      Object.keys(runDriversRef.current).forEach(key => { runDriversRef.current[key] = false; });
+
+      setOpenFiles([]);
+      setActiveFile(null);
+      setShowDiff(false);
+      setDiffData(null);
+      setAiLoading(false);
+      setRunControlLoading(false);
+
+      const fresh = createChatSession(1);
+      setChats([fresh]);
+      setActiveChatId(fresh.id);
+
+      await loadFileTree();
+      showStatus(`已切换工作目录: ${info.workspace_root}`);
+    } catch (e: any) {
+      showStatus(`切换工作目录失败: ${e.message}`);
+    }
+  }, [flushAllPendingSaves, loadFileTree, showStatus]);
 
   const getCurrentFileContent = useCallback((path: string): string | undefined => {
     const file = openFiles.find(f => f.path === path);
@@ -492,6 +610,7 @@ export default function App() {
         ? {
           ...chat, messages: [], lastAIResult: null, executionEvents: [], draftSnippets: [],
           runId: undefined, needsUserTrigger: false, pendingActions: [], runStatus: undefined,
+          runChanges: {}, revertedRuns: {},
         }
         : chat
     ));
@@ -522,11 +641,22 @@ export default function App() {
       chat.id === chatId
         ? {
           ...chat,
-          executionEvents: mergeExecutionEvents(chat.executionEvents, run.events || []),
+          executionEvents: (() => {
+            const merged = mergeExecutionEvents(chat.executionEvents, run.events || [], run.run_id);
+            return run.status && run.status !== 'running' ? clearTemporaryPlanningEvents(merged) : merged;
+          })(),
           pendingActions: (run.latest_batch?.actions || []).filter((a: ActionSpec) => (run.pending_action_ids || []).includes(a.id)),
           needsUserTrigger: (run.pending_action_ids || []).length > 0 && run.status === 'waiting_user',
           runId: run.run_id || chat.runId,
           runStatus: run.status || chat.runStatus,
+          runChanges: (() => {
+            const written = getWrittenChanges(run.result_changes);
+            if (!run.run_id || written.length === 0) return chat.runChanges;
+            return { ...chat.runChanges, [run.run_id]: written };
+          })(),
+          revertedRuns: run.run_id
+            ? { ...chat.revertedRuns, [run.run_id]: false }
+            : chat.revertedRuns,
         }
         : chat
     ));
@@ -595,7 +725,22 @@ export default function App() {
                 return [...chat.messages, { role: 'assistant', content: result.content }];
               })(),
               lastAIResult: result,
-              executionEvents: mergeExecutionEvents(chat.executionEvents, result.run?.events || []),
+              executionEvents: mergeExecutionEvents(
+                chat.executionEvents,
+                result.run?.events || [],
+                result.run_id || result.run?.run_id,
+              ),
+              runChanges: (() => {
+                const runId = result.run_id || result.run?.run_id;
+                const written = getWrittenChanges(result.changes);
+                if (!runId || written.length === 0) return chat.runChanges;
+                return { ...chat.runChanges, [runId]: written };
+              })(),
+              revertedRuns: (() => {
+                const runId = result.run_id || result.run?.run_id;
+                if (!runId) return chat.revertedRuns;
+                return { ...chat.revertedRuns, [runId]: false };
+              })(),
               runId: result.run_id || result.run?.run_id || chat.runId,
               needsUserTrigger: result.needs_user_trigger === true,
               pendingActions: result.pending_actions || [],
@@ -685,7 +830,22 @@ export default function App() {
               ...chat,
               messages: chat.messages,
               lastAIResult: result,
-              executionEvents: mergeExecutionEvents(chat.executionEvents, result.run?.events || []),
+              executionEvents: mergeExecutionEvents(
+                chat.executionEvents,
+                result.run?.events || [],
+                result.run_id || result.run?.run_id,
+              ),
+              runChanges: (() => {
+                const runId = result.run_id || result.run?.run_id;
+                const written = getWrittenChanges(result.changes);
+                if (!runId || written.length === 0) return chat.runChanges;
+                return { ...chat.runChanges, [runId]: written };
+              })(),
+              revertedRuns: (() => {
+                const runId = result.run_id || result.run?.run_id;
+                if (!runId) return chat.revertedRuns;
+                return { ...chat.revertedRuns, [runId]: false };
+              })(),
               draftSnippets: [],
               runId: result.run_id || result.run?.run_id || chat.runId,
               needsUserTrigger: result.needs_user_trigger === true,
@@ -729,7 +889,12 @@ export default function App() {
       const errMsg: ChatMessage = { role: 'assistant', content: `❌ 错误: ${e.message}` };
       setChats(prev => prev.map(chat =>
         chat.id === activeChatId
-          ? { ...chat, messages: [...chat.messages, errMsg] }
+          ? {
+            ...chat,
+            messages: [...chat.messages, errMsg],
+            executionEvents: clearTemporaryPlanningEvents(chat.executionEvents),
+            runStatus: 'failed',
+          }
           : chat
       ));
     } finally {
@@ -783,9 +948,15 @@ export default function App() {
     }
     runDriversRef.current[target.runId] = false;
     setRunControlLoading(true);
+    setAiLoading(false);
     try {
       const run = await api.cancelRun(target.runId);
       syncRunIntoChat(activeChatId, run);
+      setChats(prev => prev.map(chat => (
+        chat.id === activeChatId
+          ? { ...chat, executionEvents: clearTemporaryPlanningEvents(chat.executionEvents), runStatus: 'cancelled' }
+          : chat
+      )));
       showStatus('已取消任务');
     } catch (e: any) {
       showStatus(`取消失败: ${e.message}`);
@@ -813,7 +984,22 @@ export default function App() {
           ? {
             ...chat,
             lastAIResult: result,
-            executionEvents: mergeExecutionEvents(chat.executionEvents, result.run?.events || []),
+            executionEvents: mergeExecutionEvents(
+              chat.executionEvents,
+              result.run?.events || [],
+              result.run_id || result.run?.run_id,
+            ),
+            runChanges: (() => {
+              const runId = result.run_id || result.run?.run_id;
+              const written = getWrittenChanges(result.changes);
+              if (!runId || written.length === 0) return chat.runChanges;
+              return { ...chat.runChanges, [runId]: written };
+            })(),
+            revertedRuns: (() => {
+              const runId = result.run_id || result.run?.run_id;
+              if (!runId) return chat.revertedRuns;
+              return { ...chat.revertedRuns, [runId]: false };
+            })(),
             runId: result.run_id || result.run?.run_id || chat.runId,
             needsUserTrigger: result.needs_user_trigger === true,
             pendingActions: result.pending_actions || [],
@@ -832,6 +1018,45 @@ export default function App() {
       setRunControlLoading(false);
     }
   }, [activeChatId, chats, showStatus, startAutoRun]);
+
+  const revertRunChanges = useCallback(async (runId: string, changes: FileChange[]) => {
+    if (!activeChatId) return;
+    if (!runId) {
+      showStatus('无法识别本次任务，无法撤销');
+      return;
+    }
+    const writable = getWrittenChanges(changes).filter(ch => typeof ch.before_content === 'string');
+    if (writable.length === 0) {
+      showStatus('当前没有可撤销的文件改动');
+      return;
+    }
+
+    let failed = 0;
+    for (const ch of writable) {
+      try {
+        await api.writeFile(ch.file_path, ch.before_content || '');
+        setOpenFiles(prev => prev.map(f => (
+          f.path === ch.file_path
+            ? { ...f, content: ch.before_content || '', modified: false }
+            : f
+        )));
+      } catch {
+        failed += 1;
+      }
+    }
+
+    await loadFileTree();
+    setChats(prev => prev.map(chat => (
+      chat.id === activeChatId
+        ? { ...chat, revertedRuns: { ...chat.revertedRuns, [runId]: failed === 0 } }
+        : chat
+    )));
+    if (failed === 0) {
+      showStatus(`已撤销本次修改（${writable.length} 个文件）`);
+    } else {
+      showStatus(`撤销完成，但有 ${failed} 个文件失败`);
+    }
+  }, [activeChatId, loadFileTree, showStatus]);
 
   const handleDiffApply = useCallback(async () => {
     if (!diffData) return;
@@ -882,8 +1107,10 @@ export default function App() {
               <FileTree
                 files={files}
                 activeFile={activeFile}
+                workspaceRoot={workspaceRoot}
                 onFileSelect={openFile}
                 onRefresh={loadFileTree}
+                onSwitchWorkspace={switchWorkspace}
                 onCreate={createItem}
                 onDelete={deleteItem}
                 onRename={renameItem}
@@ -966,6 +1193,8 @@ export default function App() {
                   activeFile={activeFile}
                   lastAIResult={activeChat?.lastAIResult || null}
                   executionEvents={activeChat?.executionEvents || []}
+                  runChanges={activeChat?.runChanges || {}}
+                  revertedRuns={activeChat?.revertedRuns || {}}
                   onApplyFile={applyFile}
                   onShowDiff={showDiffView}
                   getCurrentFileContent={getCurrentFileContent}
@@ -976,6 +1205,7 @@ export default function App() {
                   onResumeRun={resumeActiveRun}
                   onCancelRun={cancelActiveRun}
                   onSubmitAskUserInput={submitAskUserInput}
+                  onRevertRunChanges={revertRunChanges}
                 />
               </div>
             </>
