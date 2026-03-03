@@ -150,6 +150,21 @@ class ClosedLoopAgent:
         run.status = "running"
         self.run_store.save(run)
 
+        interaction_action = self._latest_interaction_action(run)
+        if interaction_action:
+            self.run_store.add_event(
+                run,
+                kind="action",
+                stage=interaction_action.type.value,
+                title=interaction_action.title,
+                detail=f"已收到用户回复：{text[:200]}",
+                status="completed",
+                iteration=run.iteration if run.iteration > 0 else None,
+                action_id=interaction_action.id,
+                input_data=interaction_action.input,
+                output_data={"user_reply": text},
+            )
+
         self.run_store.add_event(
             run,
             kind="action",
@@ -162,6 +177,15 @@ class ClosedLoopAgent:
         )
 
         return await self._plan_iteration(run_id)
+
+    def _latest_interaction_action(self, run) -> ActionSpec | None:
+        batch = run.latest_batch
+        if not batch:
+            return None
+        for action in reversed(batch.actions):
+            if action.type in {ActionType.ASK_USER, ActionType.REQUEST_APPROVAL}:
+                return action
+        return None
 
     async def _plan_iteration(self, run_id: str) -> AIResponse:
         run = self.run_store.get(run_id)

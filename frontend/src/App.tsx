@@ -77,6 +77,9 @@ function mergeExecutionEvents(prev: ExecutionEvent[], incoming: ExecutionEvent[]
     !incomingHasRealEvents || !(evt.stage === 'planning' && evt.status === 'running' && !!(evt.data as any)?.temporary)
   ));
   return merged.sort((a, b) => {
+    const sa = typeof a.sequence === 'number' ? a.sequence : Number.MAX_SAFE_INTEGER;
+    const sb = typeof b.sequence === 'number' ? b.sequence : Number.MAX_SAFE_INTEGER;
+    if (sa !== sb) return sa - sb;
     const ta = a.timestamp ? Date.parse(a.timestamp) : 0;
     const tb = b.timestamp ? Date.parse(b.timestamp) : 0;
     if (ta !== tb) return ta - tb;

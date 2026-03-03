@@ -128,6 +128,9 @@ export default function ChatPanel({
 
   const currentProviderInfo = providers.find(p => p.id === currentProvider);
   const sortedEvents = [...executionEvents].sort((a, b) => {
+    const sa = typeof a.sequence === 'number' ? a.sequence : Number.MAX_SAFE_INTEGER;
+    const sb = typeof b.sequence === 'number' ? b.sequence : Number.MAX_SAFE_INTEGER;
+    if (sa !== sb) return sa - sb;
     const ta = a.timestamp ? Date.parse(a.timestamp) : 0;
     const tb = b.timestamp ? Date.parse(b.timestamp) : 0;
     if (ta !== tb) return ta - tb;
@@ -199,15 +202,31 @@ export default function ChatPanel({
         const sa = statusRank[a.status] ?? 0;
         const sb = statusRank[b.status] ?? 0;
         if (sa !== sb) return sb - sa;
+        const qa = typeof a.sequence === 'number' ? a.sequence : Number.MAX_SAFE_INTEGER;
+        const qb = typeof b.sequence === 'number' ? b.sequence : Number.MAX_SAFE_INTEGER;
+        if (qa !== qb) return qb - qa;
         const ta = a.timestamp ? Date.parse(a.timestamp) : 0;
         const tb = b.timestamp ? Date.parse(b.timestamp) : 0;
         return tb - ta;
       })[0];
     }).sort((a, b) => {
+      const sa = typeof a.sequence === 'number' ? a.sequence : Number.MAX_SAFE_INTEGER;
+      const sb = typeof b.sequence === 'number' ? b.sequence : Number.MAX_SAFE_INTEGER;
+      if (sa !== sb) return sa - sb;
       const ta = a.timestamp ? Date.parse(a.timestamp) : 0;
       const tb = b.timestamp ? Date.parse(b.timestamp) : 0;
       return ta - tb;
-    }).filter(evt => evt.stage !== 'iteration_summary');
+    }).filter(evt => evt.stage !== 'iteration_summary' && evt.status !== 'queued');
+  };
+
+  const formatEventTime = (timestamp?: string) => {
+    if (!timestamp) return '';
+    const d = new Date(timestamp);
+    const hh = String(d.getHours()).padStart(2, '0');
+    const mm = String(d.getMinutes()).padStart(2, '0');
+    const ss = String(d.getSeconds()).padStart(2, '0');
+    const ms = String(d.getMilliseconds()).padStart(3, '0');
+    return `${hh}:${mm}:${ss}.${ms}`;
   };
 
   const getDisplayText = (evt: ExecutionEvent): { title: string; detail: string } => {
@@ -559,6 +578,13 @@ export default function ChatPanel({
                 <EventIcon status={evt.status} />
                 <div className="min-w-0">
                   {(() => {
+                    const isInteractionPending = (
+                      (evt.stage === 'ask_user' || evt.stage === 'request_approval')
+                      && ['queued', 'running', 'waiting_user'].includes(evt.status)
+                    );
+                    return (
+                  <>
+                  {(() => {
                     const display = getDisplayText(evt);
                     return (
                       <>
@@ -567,10 +593,10 @@ export default function ChatPanel({
                           {typeof evt.iteration === 'number' && (
                             <span className="ml-1 text-[10px] text-text-secondary">iter {evt.iteration}</span>
                           )}
-                          {evt.stage === 'ask_user' && (evt.input as any)?.question && (
+                          {evt.stage === 'ask_user' && isInteractionPending && (evt.input as any)?.question && (
                             <span className="ml-2 text-[10px] text-[#ffd58a]">等待你的补充信息</span>
                           )}
-                          {evt.stage === 'request_approval' && (
+                          {evt.stage === 'request_approval' && isInteractionPending && (
                             <span className="ml-2 text-[10px] text-[#ffd58a]">等待你的确认</span>
                           )}
                           {(() => {
@@ -601,7 +627,7 @@ export default function ChatPanel({
                         {display.detail && (
                           <div className="text-[11px] text-text-secondary whitespace-pre-wrap">{display.detail}</div>
                         )}
-                        {(evt.stage === 'ask_user' || evt.stage === 'request_approval') && (
+                        {(evt.stage === 'ask_user' || evt.stage === 'request_approval') && isInteractionPending && (
                           <div className="mt-2 space-y-1">
                             <textarea
                               className="w-full bg-[#1b2230] text-text-primary text-xs px-2 py-1.5 rounded border border-[#334055] outline-none focus:border-accent resize-y min-h-[54px]"
@@ -646,7 +672,8 @@ export default function ChatPanel({
                   })()}
                   <div className="text-[10px] text-[#8ba0bd] font-mono">
                     {evt.stage}
-                    {evt.timestamp && ` · ${new Date(evt.timestamp).toLocaleTimeString()}`}
+                    {typeof evt.sequence === 'number' && ` · #${evt.sequence}`}
+                    {evt.timestamp && ` · ${formatEventTime(evt.timestamp)}`}
                   </div>
                   {((evt.data && Object.keys(evt.data).length > 0) || evt.stage === 'ask_user' || evt.stage === 'request_approval') && (
                     <div className="mt-1">
@@ -662,6 +689,9 @@ export default function ChatPanel({
                       )}
                     </div>
                   )}
+                  </>
+                    );
+                  })()}
                 </div>
               </div>
             ))}

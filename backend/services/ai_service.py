@@ -175,6 +175,8 @@ PLANNER_SYSTEM_PROMPT = """你是 Nexar 的动作规划器（Planner）。
 8) 对 final_answer 动作：response 必须包含 content（字符串）。
 9) 规划时优先结合 conversation_history 理解多轮上下文，不要只看 original_user_query。
 10) 如果提供了 conversation_summary，应先结合该摘要再阅读 conversation_history。
+11) 对 run_command 类动作，必须优先使用非交互命令（避免需要人工选择/确认）；若可能触发交互，请先 ask_user 确认执行方案。
+12) 当前阶段目标是“规划与写代码”，禁止输出环境安装/初始化类命令（如 npm/pnpm/yarn install、pip install、create-vite、tailwindcss init 等）；此类步骤留给用户在代码完成后手动执行。
 
 输出格式：
 {
@@ -190,7 +192,7 @@ PLANNER_SYSTEM_PROMPT = """你是 Nexar 的动作规划器（Planner）。
   "actions": [
     {
       "id": "a1",
-      "type": "scan_workspace|read_files|search_code|extract_symbols|analyze_dependencies|summarize_context|propose_subplan|run_command|run_tests|run_lint|run_build|create_file|update_file|delete_file|move_file|apply_patch|validate_result|ask_user|request_approval|final_answer|report_blocker",
+      "type": "scan_workspace|read_files|search_code|extract_symbols|analyze_dependencies|summarize_context|run_command|run_tests|run_lint|run_build|create_file|update_file|delete_file|move_file|apply_patch|validate_result|ask_user|request_approval|final_answer|report_blocker",
       "title": "动作标题",
       "reason": "动作原因",
       "input": {},

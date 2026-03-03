@@ -2,7 +2,9 @@ from __future__ import annotations
 
 import difflib
 import hashlib
+import os
 import re
+import shlex
 import subprocess
 from dataclasses import dataclass, field
 from datetime import datetime
@@ -46,6 +48,15 @@ class ActionExecutor:
             status = "blocked" if blocked else "completed"
             if blocked and action.type in {ActionType.ASK_USER, ActionType.REQUEST_APPROVAL}:
                 status = "waiting_user"
+            error_text: str | None = None
+            if action.type in {ActionType.RUN_COMMAND, ActionType.RUN_TESTS, ActionType.RUN_LINT, ActionType.RUN_BUILD}:
+                exit_code = output.get("exit_code") if isinstance(output, dict) else None
+                if isinstance(exit_code, int) and exit_code != 0:
+                    status = "failed"
+                    stderr = str(output.get("stderr") or "").strip() if isinstance(output, dict) else ""
+                    error_text = f"命令执行失败 (exit={exit_code})"
+                    if stderr:
+                        error_text = f"{error_text}: {stderr[:300]}"
             ended = datetime.utcnow().isoformat()
             return ActionExecutionOutcome(
                 record=ActionExecutionRecord(
@@ -58,11 +69,12 @@ class ActionExecutor:
                     input=action.input,
                     output=output,
                     artifacts=action.artifacts,
+                    error=error_text,
                     started_at=started,
                     ended_at=ended,
                 ),
                 file_changes=file_changes,
-                assistant_message=assistant_message,
+                assistant_message=assistant_message or error_text,
                 final_answer=final_answer,
                 blocked=blocked,
             )
@@ -281,20 +293,41 @@ class ActionExecutor:
         command = str(action.input.get("command") or "").strip()
         if not command:
             return {"command": "", "exit_code": 1, "stderr": "empty command"}
-        proc = subprocess.run(
-            command,
-            cwd=file_service.get_workspace_root(),
-            shell=True,
-            capture_output=True,
-            text=True,
-            timeout=int(action.timeout_sec or 120),
-        )
-        return {
-            "command": command,
-            "exit_code": proc.returncode,
-            "stdout": (proc.stdout or "")[:6000],
-            "stderr": (proc.stderr or "")[:4000],
-        }
+        precheck = self._precheck_interactive_command(command)
+        if precheck:
+            return precheck
+        env = os.environ.copy()
+        env["CI"] = "1"
+        env["DEBIAN_FRONTEND"] = "noninteractive"
+        env["npm_config_yes"] = "true"
+        timeout_sec = int(action.timeout_sec or 120)
+        try:
+            proc = subprocess.run(
+                command,
+                cwd=file_service.get_workspace_root(),
+                shell=True,
+                capture_output=True,
+                text=True,
+                timeout=timeout_sec,
+                stdin=subprocess.DEVNULL,
+                env=env,
+            )
+            return {
+                "command": command,
+                "exit_code": proc.returncode,
+                "stdout": (proc.stdout or "")[:6000],
+                "stderr": (proc.stderr or "")[:4000],
+            }
+        except subprocess.TimeoutExpired as err:
+            return {
+                "command": command,
+                "exit_code": 124,
+                "stdout": str(err.stdout or "")[:6000],
+                "stderr": (
+                    f"Command timed out after {timeout_sec} seconds. "
+                    "可能是命令需要交互输入（选择/确认）。请改用非交互参数，或拆分为明确步骤。"
+                ),
+            }
 
     async def _write_file_action(self, req: AIRequestSnapshot, action: ActionSpec) -> tuple[dict[str, Any], list[FileChange]]:
         path = str(action.input.get("path") or "")
@@ -414,3 +447,62 @@ class ActionExecutor:
             return True
         suffix = Path(rel_path).suffix.lower()
         return suffix in {".png", ".jpg", ".jpeg", ".gif", ".ico", ".pdf", ".lock", ".mp4", ".zip"}
+
+    def _precheck_interactive_command(self, command: str) -> dict[str, Any] | None:
+        try:
+            tokens = shlex.split(command)
+        except Exception:
+            tokens = command.strip().split()
+        if not tokens:
+            return None
+
+        # Guard common interactive scaffold commands in non-empty target directories.
+        lower = [t.lower() for t in tokens]
+        is_vite_scaffold = (
+            ("npm" in lower and ("create" in lower or "init" in lower) and any("vite" in t for t in lower))
+            or ("npx" in lower and any("create-vite" in t for t in lower))
+        )
+        if not is_vite_scaffold:
+            return None
+
+        target: str | None = None
+        if "npx" in lower:
+            npx_idx = lower.index("npx")
+            for tok in tokens[npx_idx + 1:]:
+                if tok.startswith("-"):
+                    continue
+                if "create-vite" in tok.lower():
+                    continue
+                target = tok
+                break
+        elif "npm" in lower and ("create" in lower or "init" in lower):
+            npm_idx = lower.index("npm")
+            for tok in tokens[npm_idx + 1:]:
+                ltok = tok.lower()
+                if ltok in {"create", "init"} or ltok.startswith("vite"):
+                    continue
+                if tok.startswith("-"):
+                    continue
+                target = tok
+                break
+
+        if not target:
+            return None
+
+        root = Path(file_service.get_workspace_root())
+        target_path = (root / target).resolve() if target not in {".", "./"} else root
+        try:
+            non_empty = target_path.exists() and target_path.is_dir() and any(target_path.iterdir())
+        except Exception:
+            non_empty = False
+        if non_empty:
+            return {
+                "command": command,
+                "exit_code": 2,
+                "stdout": "",
+                "stderr": (
+                    f"目标目录 `{target}` 非空，脚手架命令很可能进入交互选择。"
+                    "请改用新目录，或先清空目标目录后再执行。"
+                ),
+            }
+        return None

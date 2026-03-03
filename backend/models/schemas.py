@@ -195,6 +195,7 @@ class ActionExecutionRecord(BaseModel):
 
 class ExecutionEvent(BaseModel):
     event_id: str
+    sequence: Optional[int] = None
     kind: str = "action"  # planning | action | system
     stage: str
     title: str

@@ -145,8 +145,16 @@ class PlanRunStore:
         artifacts: list[str] | None = None,
         error: str | None = None,
     ) -> PlanRunInfo:
+        next_sequence = 1
+        if run.events:
+            last_seq = run.events[-1].sequence
+            if isinstance(last_seq, int) and last_seq > 0:
+                next_sequence = last_seq + 1
+            else:
+                next_sequence = len(run.events) + 1
         event = ExecutionEvent(
             event_id=str(uuid.uuid4()),
+            sequence=next_sequence,
             kind=kind,
             stage=stage,
             title=title,

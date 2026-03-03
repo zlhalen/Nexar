@@ -164,6 +164,7 @@ export interface PlanRunStepInfo {
 
 export interface ExecutionEvent {
   event_id: string;
+  sequence?: number;
   kind?: string;
   stage: string;
   title: string;

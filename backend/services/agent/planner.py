@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import re
 from typing import Any
 
 from backend.models.schemas import (
@@ -18,7 +19,9 @@ class PlannerService:
     """LLM planner that outputs a structured ActionBatch."""
 
     def __init__(self):
-        self.available_actions = [t.value for t in ActionType]
+        # `propose_subplan` is a deprecated no-op action.
+        # Keep enum compatibility but do not offer it to planner.
+        self.available_actions = [t.value for t in ActionType if t != ActionType.PROPOSE_SUBPLAN]
 
     async def plan_next(
         self,
@@ -75,11 +78,25 @@ class PlannerService:
             batch.decision.reason = batch.decision.reason or "planner returned empty actions"
             batch.decision.needs_user_trigger = True
         seen: set[str] = set()
+        skipped_action_ids: set[str] = set()
         normalized: list[ActionSpec] = []
         for idx, action in enumerate(batch.actions, start=1):
             if not action.id or action.id in seen:
                 action.id = f"a{idx}"
             seen.add(action.id)
+            if action.type == ActionType.PROPOSE_SUBPLAN:
+                # Downgrade deprecated no-op action to context summary to avoid execution dead-ends.
+                action.type = ActionType.SUMMARIZE_CONTEXT
+                if not action.title.strip():
+                    action.title = "汇总上下文"
+                if not action.reason.strip():
+                    action.reason = "替代已废弃的 propose_subplan"
+                action.input = {}
+            if action.type in {ActionType.RUN_COMMAND, ActionType.RUN_TESTS, ActionType.RUN_LINT, ActionType.RUN_BUILD}:
+                command = str(action.input.get("command") or "")
+                if self._is_environment_setup_command(command):
+                    skipped_action_ids.add(action.id)
+                    continue
             if action.type == ActionType.FINAL_ANSWER:
                 batch.decision.mode = "done"
                 action.can_parallel = False
@@ -97,8 +114,15 @@ class PlannerService:
                 action.success_criteria = ["动作执行完成且输出有效"]
             normalized.append(action)
 
+        if skipped_action_ids:
+            for action in normalized:
+                if action.depends_on:
+                    action.depends_on = [dep for dep in action.depends_on if dep not in skipped_action_ids]
+
         normalized = self._ensure_scan_before_discovery(normalized, action_history)
         batch.actions = normalized
+        if skipped_action_ids:
+            batch.risks.append("已自动跳过环境安装/初始化命令，请在代码完成后手动执行依赖安装与初始化。")
         return batch
 
     def _ensure_scan_before_discovery(
@@ -148,6 +172,30 @@ class PlannerService:
                     action.can_parallel = False
 
         return result
+
+    def _is_environment_setup_command(self, command: str) -> bool:
+        text = (command or "").strip().lower()
+        if not text:
+            return False
+        patterns = [
+            r"\bnpm\s+(install|i|ci)\b",
+            r"\bpnpm\s+(install|i)\b",
+            r"\byarn\s+(install|add)\b",
+            r"\bbun\s+install\b",
+            r"\bpip(?:3)?\s+install\b",
+            r"\bpoetry\s+install\b",
+            r"\buv\s+pip\s+install\b",
+            r"\bgo\s+get\b",
+            r"\bcargo\s+add\b",
+            r"\bcomposer\s+install\b",
+            r"\bcreate-vite\b",
+            r"\bnpm\s+create\b",
+            r"\byarn\s+create\b",
+            r"\bpnpm\s+create\b",
+            r"\btailwindcss\s+init\b",
+            r"\bnpx\s+.*\binit\b",
+        ]
+        return any(re.search(p, text) for p in patterns)
 
 
 def batch_to_json(batch: ActionBatch) -> str:
