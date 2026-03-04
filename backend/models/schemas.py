@@ -124,10 +124,10 @@ class StepRunInfo(BaseModel):
 class ActionType(str, Enum):
     SCAN_WORKSPACE = "scan_workspace"
     READ_FILES = "read_files"
+    READ_FILE_RANGES = "read_file_ranges"
     SEARCH_CODE = "search_code"
     EXTRACT_SYMBOLS = "extract_symbols"
     ANALYZE_DEPENDENCIES = "analyze_dependencies"
-    SUMMARIZE_CONTEXT = "summarize_context"
     PROPOSE_SUBPLAN = "propose_subplan"
     RUN_COMMAND = "run_command"
     RUN_TESTS = "run_tests"

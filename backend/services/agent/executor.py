@@ -109,14 +109,14 @@ class ActionExecutor:
             return self._scan_workspace(action), [], None, None, False
         if action.type == ActionType.READ_FILES:
             return self._read_files(action), [], None, None, False
+        if action.type == ActionType.READ_FILE_RANGES:
+            return self._read_file_ranges(action), [], None, None, False
         if action.type == ActionType.SEARCH_CODE:
             return self._search_code(action), [], None, None, False
         if action.type == ActionType.EXTRACT_SYMBOLS:
             return self._extract_symbols(action), [], None, None, False
         if action.type == ActionType.ANALYZE_DEPENDENCIES:
             return self._analyze_dependencies(action), [], None, None, False
-        if action.type == ActionType.SUMMARIZE_CONTEXT:
-            return self._summarize_context(history), [], None, None, False
         if action.type == ActionType.PROPOSE_SUBPLAN:
             return self._propose_subplan(action), [], None, None, False
         if action.type in {ActionType.RUN_COMMAND, ActionType.RUN_TESTS, ActionType.RUN_LINT, ActionType.RUN_BUILD}:
@@ -149,7 +149,9 @@ class ActionExecutor:
         limit = int(action.input.get("limit", 200))
         root = Path(file_service.get_workspace_root())
         files: list[str] = []
+        file_stats: list[dict[str, Any]] = []
         dirs: set[str] = set()
+        sampled_total_lines = 0
         for path in root.rglob("*"):
             rel = str(path.relative_to(root))
             if self._ignored(rel):
@@ -158,13 +160,22 @@ class ActionExecutor:
                 dirs.add(rel)
                 continue
             files.append(rel)
+            try:
+                text = path.read_text(encoding="utf-8", errors="replace")
+                line_count = len(text.splitlines())
+                sampled_total_lines += line_count
+                file_stats.append({"path": rel, "line_count": line_count, "chars": len(text)})
+            except Exception as err:
+                file_stats.append({"path": rel, "line_count": None, "error": str(err)})
             if len(files) >= limit:
                 break
         return {
             "root": str(root),
             "files": files,
+            "file_stats": file_stats,
             "file_count": len(files),
             "dir_count": len(dirs),
+            "sampled_total_lines": sampled_total_lines,
         }
 
     def _read_files(self, action: ActionSpec) -> dict[str, Any]:
@@ -181,25 +192,141 @@ class ActionExecutor:
             paths = [str(p) for p in raw_paths if p]
         else:
             paths = []
-        max_chars = int(action.input.get("max_chars", 120000))
+        max_chars = int(action.input.get("max_chars", 12000))
+        max_total_chars = int(action.input.get("max_total_chars", 60000))
+        limit_files = int(action.input.get("limit_files", action.input.get("limit", 8)))
         results = []
-        for path in paths[:50]:
+        total_returned_chars = 0
+        omitted_files_count = max(0, len(paths) - max(0, limit_files))
+        truncated_by_budget = False
+        for path in paths[: max(0, limit_files)]:
             try:
                 content = file_service.read_file(path).content
-                truncated = len(content) > max_chars
-                text = content[:max_chars]
+                remaining = max_total_chars - total_returned_chars
+                if remaining <= 0:
+                    truncated_by_budget = True
+                    omitted_files_count += 1
+                    continue
+                allowed_chars = min(max_chars, remaining)
+                text = content[:allowed_chars]
+                truncated = len(content) > len(text)
+                content_truncated_by_budget = remaining < max_chars and len(content) > len(text)
+                total_returned_chars += len(text)
                 results.append(
                     {
                         "path": path,
                         "chars": len(content),
                         "content": text,
                         "content_truncated": truncated,
+                        "content_truncated_by_budget": content_truncated_by_budget,
                         "returned_chars": len(text),
                     }
                 )
             except Exception as err:
                 results.append({"path": path, "error": str(err)})
-        return {"files": results}
+        return {
+            "files": results,
+            "file_count_requested": len(paths),
+            "file_count_returned": len(results),
+            "limit_files": max(0, limit_files),
+            "max_chars": max_chars,
+            "max_total_chars": max_total_chars,
+            "total_returned_chars": total_returned_chars,
+            "omitted_files_count": omitted_files_count,
+            "truncated_by_budget": truncated_by_budget,
+        }
+
+    def _read_file_ranges(self, action: ActionSpec) -> dict[str, Any]:
+        raw_items = action.input.get("items") or action.input.get("ranges") or []
+        if not isinstance(raw_items, list) or not raw_items:
+            return {"ranges": [], "reason": "no_ranges"}
+
+        context_before = int(action.input.get("context_before", 40))
+        context_after = int(action.input.get("context_after", 40))
+        max_total_chars = int(action.input.get("max_total_chars", 60000))
+        max_items = int(action.input.get("max_items", 40))
+
+        ranges: list[dict[str, Any]] = []
+        total_returned_chars = 0
+        truncated_by_budget = False
+        omitted_ranges_count = max(0, len(raw_items) - max(0, max_items))
+
+        for item in raw_items[: max(0, max_items)]:
+            if not isinstance(item, dict):
+                continue
+            path = str(item.get("path") or item.get("file_path") or "").strip()
+            if not path:
+                continue
+            start_line = int(item.get("start_line", item.get("line", 1)))
+            end_line = int(item.get("end_line", start_line))
+            if start_line < 1:
+                start_line = 1
+            if end_line < start_line:
+                end_line = start_line
+
+            try:
+                content = file_service.read_file(path).content
+            except Exception as err:
+                ranges.append({"path": path, "error": str(err)})
+                continue
+
+            lines = content.splitlines()
+            total_lines = len(lines)
+            if total_lines == 0:
+                ranges.append(
+                    {
+                        "path": path,
+                        "start_line": start_line,
+                        "end_line": end_line,
+                        "effective_start": 1,
+                        "effective_end": 0,
+                        "line_count": 0,
+                        "content": "",
+                        "returned_chars": 0,
+                    }
+                )
+                continue
+
+            effective_start = max(1, start_line - context_before)
+            effective_end = min(total_lines, end_line + context_after)
+            segment = "\n".join(lines[effective_start - 1:effective_end])
+
+            remaining = max_total_chars - total_returned_chars
+            if remaining <= 0:
+                truncated_by_budget = True
+                omitted_ranges_count += 1
+                continue
+
+            returned = segment[:remaining]
+            if len(returned) < len(segment):
+                truncated_by_budget = True
+            total_returned_chars += len(returned)
+
+            ranges.append(
+                {
+                    "path": path,
+                    "start_line": start_line,
+                    "end_line": end_line,
+                    "effective_start": effective_start,
+                    "effective_end": effective_end,
+                    "line_count": max(0, effective_end - effective_start + 1),
+                    "content": returned,
+                    "returned_chars": len(returned),
+                    "content_truncated_by_budget": len(returned) < len(segment),
+                }
+            )
+
+        return {
+            "ranges": ranges,
+            "range_count_requested": len(raw_items),
+            "range_count_returned": len(ranges),
+            "context_before": context_before,
+            "context_after": context_after,
+            "max_total_chars": max_total_chars,
+            "total_returned_chars": total_returned_chars,
+            "omitted_ranges_count": omitted_ranges_count,
+            "truncated_by_budget": truncated_by_budget,
+        }
 
     def _search_code(self, action: ActionSpec) -> dict[str, Any]:
         keyword = str(action.input.get("query") or "").strip()
@@ -309,23 +436,115 @@ class ActionExecutor:
         }
 
     def _extract_symbols(self, action: ActionSpec) -> dict[str, Any]:
+        import ast
+
         paths = action.input.get("paths") or []
         if not paths:
-            return {"symbols": [], "reason": "no_paths"}
+            return {"ast": [], "reason": "no_paths"}
         root = Path(file_service.get_workspace_root())
-        pat = re.compile(r"^\s*(def|class|function)\s+([A-Za-z_][\w]*)")
-        symbols: list[dict[str, Any]] = []
+        ast_summaries: list[dict[str, Any]] = []
         for path in paths[:50]:
             target = root / path
             try:
                 text = target.read_text(encoding="utf-8", errors="replace")
-            except Exception:
+            except Exception as err:
+                ast_summaries.append({"path": path, "error": str(err)})
                 continue
-            for idx, line in enumerate(text.splitlines(), start=1):
-                m = pat.search(line)
-                if m:
-                    symbols.append({"path": path, "line": idx, "kind": m.group(1), "name": m.group(2)})
-        return {"symbols": symbols}
+            suffix = target.suffix.lower()
+            if suffix == ".py":
+                try:
+                    tree = ast.parse(text)
+                except Exception as err:
+                    ast_summaries.append({"path": path, "error": f"ast_parse_failed: {err}"})
+                    continue
+
+                imports: list[dict[str, Any]] = []
+                top_level: list[dict[str, Any]] = []
+                counts = {"imports": 0, "classes": 0, "functions": 0, "async_functions": 0}
+                for node in tree.body:
+                    if isinstance(node, (ast.Import, ast.ImportFrom)):
+                        counts["imports"] += 1
+                        import_stmt = ""
+                        if isinstance(node, ast.Import):
+                            names = []
+                            for alias in node.names:
+                                alias_text = alias.name
+                                if alias.asname:
+                                    alias_text += f" as {alias.asname}"
+                                names.append(alias_text)
+                            import_stmt = f"import {', '.join(names)}"
+                        else:
+                            module = "." * int(getattr(node, "level", 0)) + str(node.module or "")
+                            names = []
+                            for alias in node.names:
+                                alias_text = alias.name
+                                if alias.asname:
+                                    alias_text += f" as {alias.asname}"
+                                names.append(alias_text)
+                            import_stmt = f"from {module} import {', '.join(names)}"
+                        imports.append({"line": int(getattr(node, "lineno", 1)), "stmt": import_stmt})
+                    elif isinstance(node, ast.ClassDef):
+                        counts["classes"] += 1
+                        if len(top_level) < 30:
+                            top_level.append({"kind": "class", "name": node.name, "line": int(getattr(node, "lineno", 1))})
+                    elif isinstance(node, ast.FunctionDef):
+                        counts["functions"] += 1
+                        if len(top_level) < 30:
+                            top_level.append({"kind": "function", "name": node.name, "line": int(getattr(node, "lineno", 1))})
+                    elif isinstance(node, ast.AsyncFunctionDef):
+                        counts["async_functions"] += 1
+                        if len(top_level) < 30:
+                            top_level.append({"kind": "async_function", "name": node.name, "line": int(getattr(node, "lineno", 1))})
+
+                ast_summaries.append(
+                    {
+                        "path": path,
+                        "language": "python",
+                        "summary": counts,
+                        "imports": imports,
+                        "top_level": top_level,
+                    }
+                )
+            else:
+                lines = text.splitlines()
+                imports: list[dict[str, Any]] = []
+                import_patterns = [
+                    re.compile(r"^\s*import\b.+"),
+                    re.compile(r"^\s*from\s+.+\s+import\s+.+"),
+                    re.compile(r"^\s*const\s+.+=\s*require\(.+\)"),
+                    re.compile(r"^\s*export\s+.+\s+from\s+.+"),
+                ]
+                for idx, line in enumerate(lines, start=1):
+                    stripped = line.strip()
+                    if not stripped:
+                        continue
+                    if any(pat.search(stripped) for pat in import_patterns):
+                        imports.append({"line": idx, "stmt": stripped})
+                compact_nodes: list[dict[str, Any]] = []
+                pat = re.compile(r"^\s*(export\s+)?(async\s+)?(function|class)\s+([A-Za-z_][\w]*)")
+                for idx, line in enumerate(lines, start=1):
+                    m = pat.search(line)
+                    if not m:
+                        continue
+                    if len(compact_nodes) >= 30:
+                        break
+                    compact_nodes.append(
+                        {
+                            "kind": "function" if m.group(3) == "function" else "class",
+                            "name": m.group(4),
+                            "line": idx,
+                        }
+                    )
+                ast_summaries.append(
+                    {
+                        "path": path,
+                        "language": "generic",
+                        "summary": {"imports": len(imports), "nodes": len(compact_nodes)},
+                        "imports": imports,
+                        "top_level": compact_nodes,
+                    }
+                )
+        return {"ast": ast_summaries}
 
     def _analyze_dependencies(self, action: ActionSpec) -> dict[str, Any]:
         path = action.input.get("path")
@@ -348,20 +567,6 @@ class ActionExecutor:
                     deps.append(m.group(1))
                     break
         return {"path": path, "dependencies": deps[:80], "dependency_count": len(deps)}
-
-    def _summarize_context(self, history: list[ActionExecutionRecord]) -> dict[str, Any]:
-        return {
-            "history_count": len(history),
-            "last_actions": [
-                {
-                    "id": rec.action_id,
-                    "type": rec.action_type.value,
-                    "status": rec.status,
-                    "error": rec.error,
-                }
-                for rec in history[-10:]
-            ],
-        }
 
     def _propose_subplan(self, action: ActionSpec) -> dict[str, Any]:
         steps = action.input.get("steps") or []

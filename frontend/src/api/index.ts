@@ -56,7 +56,6 @@ export type ActionType =
   | 'search_code'
   | 'extract_symbols'
   | 'analyze_dependencies'
-  | 'summarize_context'
   | 'propose_subplan'
   | 'run_command'
   | 'run_tests'

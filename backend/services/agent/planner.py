@@ -85,13 +85,16 @@ class PlannerService:
                 action.id = f"a{idx}"
             seen.add(action.id)
             if action.type == ActionType.PROPOSE_SUBPLAN:
-                # Downgrade deprecated no-op action to context summary to avoid execution dead-ends.
-                action.type = ActionType.SUMMARIZE_CONTEXT
+                # Downgrade deprecated no-op action to code search to avoid dead-ends.
+                action.type = ActionType.SEARCH_CODE
                 if not action.title.strip():
-                    action.title = "汇总上下文"
+                    action.title = "检索相关代码"
                 if not action.reason.strip():
                     action.reason = "替代已废弃的 propose_subplan"
-                action.input = {}
+                if not isinstance(action.input, dict):
+                    action.input = {}
+                action.input.setdefault("query", "TODO")
+                action.input.setdefault("limit", 20)
             if action.type in {ActionType.RUN_COMMAND, ActionType.RUN_TESTS, ActionType.RUN_LINT, ActionType.RUN_BUILD}:
                 command = str(action.input.get("command") or "")
                 if self._is_environment_setup_command(command):
@@ -133,6 +136,7 @@ class PlannerService:
         discovery_types = {
             ActionType.SEARCH_CODE,
             ActionType.READ_FILES,
+            ActionType.READ_FILE_RANGES,
             ActionType.EXTRACT_SYMBOLS,
             ActionType.ANALYZE_DEPENDENCIES,
         }

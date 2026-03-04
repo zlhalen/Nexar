@@ -165,21 +165,25 @@ SYSTEM_PROMPT = """你是一个专业的AI编程助手。你可以帮助用户�
 PLANNER_SYSTEM_PROMPT = """你是 Nexar 的动作规划器（Planner）。
 
 你必须基于输入上下文，输出下一轮 ActionBatch JSON，严格遵守：
-1) 不要写死固定流程，不要假设状态机；只决定“下一批 actions”。
-2) 输出必须是可执行、可验证的动作（每个 action 都要有 success_criteria）。
-3) 信息不足时输出 ask_user / request_approval，不要臆造文件内容。
-4) 当目标满足时，decision.mode=done，必须输出 final_answer 动作，并在 action.response.content 中给出最终答复文本。
-5) 只返回 JSON，不要 Markdown，不要解释文字。
-6) 发现/搜索类动作要遵守前置顺序：先 scan_workspace，再 search_code/read_files/analyze_dependencies（可用 depends_on 表达）。
-7) 对 create_file/update_file/apply_patch 动作：input 必须包含 path，且至少包含 content 或 instruction 之一。
-8) 对 final_answer 动作：response 必须包含 content（字符串）。
-9) 规划时优先结合 conversation_history 理解多轮上下文，不要只看 original_user_query。
-10) 如果提供了 conversation_summary，应先结合该摘要再阅读 conversation_history。
-11) 对 run_command 类动作，必须优先使用非交互命令（避免需要人工选择/确认）；若可能触发交互，请先 ask_user 确认执行方案。
+1) 不要写死固定流程，不要假设状态机；你需要根据当前证据自主决定下一批 actions。
+2) 每轮先判断“信息是否已足够支撑结论或改动”；若不足，再选择最低成本的取证动作（如 search/read/range/dependency），若足够则收敛到 final_answer 或后续执行动作。
+3) 输出必须是可执行、可验证的动作（每个 action 都要有 success_criteria），并在 reason 里说明该动作要消除哪一个不确定点。
+4) 信息不足时输出 ask_user / request_approval，不要臆造文件内容；有明确证据后再做结论。
+5) 当目标满足时，decision.mode=done，必须输出 final_answer 动作，并在 action.response.content 中给出最终答复文本。
+6) 只返回 JSON，不要 Markdown，不要解释文字。
+7) 规划时优先结合 conversation_history 与 conversation_summary，不要只看 original_user_query。
+8) 控制上下文成本：避免一次性读取大量大文件；优先小范围、可验证、信息增益高的动作；信息增益低时应停止重复读取并切换策略。
+9) decision.needs_user_trigger 仅作兼容字段：串行模式下是否等待用户由 ask_user/request_approval 动作决定；decision.mode 为 continue/done/blocked 时 needs_user_trigger 必须为 false。
+10) 对 create_file/update_file/apply_patch 动作：input 必须包含 path，且至少包含 content 或 instruction 之一。
+11) 对 final_answer 动作：response 必须包含 content（字符串）。
 12) 当前阶段目标是“规划与写代码”，禁止输出环境安装/初始化类命令（如 npm/pnpm/yarn install、pip install、create-vite、tailwindcss init 等）；此类步骤留给用户在代码完成后手动执行。
-13) search_code 的 input 字段只允许：query, root, paths, regex, limit。禁止输出 patterns/include/file_glob/max_results/case_sensitive 等其他字段。
-14) run_command/run_tests/run_lint/run_build 的 input 字段只允许：command, cwd。cwd 必须是相对 workspace_root 的路径（如 frontend、backend）或 workspace 内绝对路径。禁止输出 working_directory/workdir/dir/path 等别名字段。
-15) 当 run_command 需要执行 Python 代码片段（尤其包含 async def、多行逻辑、try/except）时，禁止使用 `python -c "..."` 单行拼接；必须使用 `python3 - <<'PY' ... PY` heredoc 多行脚本格式。
+13) search_code 的 input 字段只允许：query, root, paths, regex, limit。禁止输出 patterns/include/file_glob/max_results/case_sensitive 等字段。
+14) search_code 的 query 规则：当 regex=false 时，query 必须是字面匹配短语，不允许 OR/AND/NOT、`|` 或正则语法；需要多关键词时拆成多个 search_code 动作。仅 regex=true 时允许 `|`。
+15) run_command/run_tests/run_lint/run_build 的 input 字段只允许：command, cwd。cwd 必须是相对 workspace_root 的路径（如 frontend、backend）或 workspace 内绝对路径；禁止 working_directory/workdir/dir/path 等别名。
+16) 当 run_command 需要执行 Python 代码片段（尤其包含 async def、多行逻辑、try/except）时，禁止 `python -c "..."` 单行拼接；必须使用 `python3 - <<'PY' ... PY` heredoc 多行脚本。
+17) 读取策略选择原则：extract_symbols 用于快速获取文件结构与入口点；read_file_ranges 用于已知命中行附近的定点取证；read_files 仅在需要整文件上下文时使用，并优先针对少量核心文件。
+18) extract_symbols 的 input.paths 必须是“文件路径列表”，不要传目录路径；若当前只有目录信息，先用 scan_workspace/search_code 选出候选文件后再调用 extract_symbols。
+19) read_file_ranges 的 input 必须使用对象数组：items 或 ranges = [{ "path": "...", "start_line": 10, "end_line": 30 }]；禁止使用 "250-500" 这类字符串区间。
 
 输出格式：
 {
@@ -195,7 +199,7 @@ PLANNER_SYSTEM_PROMPT = """你是 Nexar 的动作规划器（Planner）。
   "actions": [
     {
       "id": "a1",
-      "type": "scan_workspace|read_files|search_code|extract_symbols|analyze_dependencies|summarize_context|run_command|run_tests|run_lint|run_build|create_file|update_file|delete_file|move_file|apply_patch|validate_result|ask_user|request_approval|final_answer|report_blocker",
+      "type": "scan_workspace|read_files|read_file_ranges|search_code|extract_symbols|analyze_dependencies|run_command|run_tests|run_lint|run_build|create_file|update_file|delete_file|move_file|apply_patch|validate_result|ask_user|request_approval|final_answer|report_blocker",
       "title": "动作标题",
       "reason": "动作原因",
       "input": {},
@@ -567,6 +571,15 @@ def _parse_action_batch_response(raw: str, iteration: int) -> ActionBatch:
     else:
         payload["actions"] = []
 
+    normalized_decision = payload.get("decision")
+    if isinstance(normalized_decision, dict):
+        mode = str(normalized_decision.get("mode") or "").strip().lower()
+        has_actions = bool(payload.get("actions"))
+        if mode in {"done", "continue", "blocked"}:
+            normalized_decision["needs_user_trigger"] = False
+        elif mode == "ask_user":
+            normalized_decision["needs_user_trigger"] = not has_actions
+
     payload["iteration"] = iteration
     batch = ActionBatch.model_validate(payload)
     return batch
@@ -591,6 +604,243 @@ def _build_history_summary(messages: list[ChatMessage], max_chars: int) -> str:
         parts.append(entry)
         total += len(entry) + (1 if parts else 0)
     return "\n".join(parts)
+
+
+def _extract_key_result_for_planner(action_type: ActionType, output: object) -> str:
+    if not isinstance(output, dict):
+        text = str(output or "").strip()
+        return text[:160] if text else ""
+
+    if action_type == ActionType.SEARCH_CODE:
+        matches = output.get("matches")
+        if isinstance(matches, list):
+            files = sorted({str(m.get("path")) for m in matches if isinstance(m, dict) and m.get("path")})
+            return f"hits={len(matches)}, files={len(files)}"
+        return "search_done"
+    if action_type == ActionType.READ_FILES:
+        returned = output.get("file_count_returned")
+        chars = output.get("total_returned_chars")
+        return f"files={returned}, chars={chars}"
+    if action_type == ActionType.READ_FILE_RANGES:
+        returned = output.get("range_count_returned")
+        chars = output.get("total_returned_chars")
+        return f"ranges={returned}, chars={chars}"
+    if action_type in {ActionType.RUN_COMMAND, ActionType.RUN_TESTS, ActionType.RUN_LINT, ActionType.RUN_BUILD}:
+        code = output.get("exit_code")
+        stderr = str(output.get("stderr") or "").strip()
+        if stderr:
+            return f"exit={code}, err={stderr[:100]}"
+        return f"exit={code}"
+    if action_type in {ActionType.CREATE_FILE, ActionType.UPDATE_FILE, ActionType.APPLY_PATCH}:
+        path = output.get("path")
+        before_len = output.get("before_len")
+        after_len = output.get("after_len")
+        return f"path={path}, {before_len}->{after_len}"
+    if action_type == ActionType.EXTRACT_SYMBOLS:
+        ast_items = output.get("ast")
+        if isinstance(ast_items, list):
+            return f"ast_files={len(ast_items)}"
+        return "ast_done"
+    if action_type == ActionType.ANALYZE_DEPENDENCIES:
+        cnt = output.get("dependency_count")
+        return f"deps={cnt}"
+    if action_type == ActionType.VALIDATE_RESULT:
+        sat = output.get("satisfied")
+        reason = str(output.get("reason") or "")
+        return f"satisfied={sat}, reason={reason[:80]}"
+
+    keys = [k for k in output.keys() if isinstance(k, str)]
+    return ",".join(keys[:5])
+
+
+def _compact_context_snapshot_for_planner(context_snapshot: dict) -> dict:
+    if not isinstance(context_snapshot, dict):
+        return {}
+    ws = context_snapshot.get("workspace", {}) if isinstance(context_snapshot.get("workspace"), dict) else {}
+    cf = context_snapshot.get("current_file", {}) if isinstance(context_snapshot.get("current_file"), dict) else {}
+    sn = context_snapshot.get("snippets", {}) if isinstance(context_snapshot.get("snippets"), dict) else {}
+    hs = context_snapshot.get("history", {}) if isinstance(context_snapshot.get("history"), dict) else {}
+
+    compact_recent = []
+    recent = hs.get("recent")
+    if isinstance(recent, list):
+        for item in recent[-10:]:
+            if not isinstance(item, dict):
+                continue
+            compact_recent.append(
+                {
+                    "type": item.get("type"),
+                    "status": item.get("status"),
+                    "error": item.get("error"),
+                }
+            )
+
+    return {
+        "workspace": {
+            "root": ws.get("root"),
+            "file_count": ws.get("file_count"),
+            "sample_files": (ws.get("sample_files") or [])[:20] if isinstance(ws.get("sample_files"), list) else [],
+        },
+        "current_file": {
+            "file": cf.get("file"),
+            "chars": cf.get("chars"),
+        },
+        "snippets": {
+            "count": sn.get("count"),
+            "paths": (sn.get("paths") or [])[:20] if isinstance(sn.get("paths"), list) else [],
+        },
+        "history": {
+            "completed": hs.get("completed"),
+            "failed": hs.get("failed"),
+            "action_type_count": hs.get("action_type_count"),
+            "recent": compact_recent,
+        },
+    }
+
+
+def _build_planner_brief(
+    *,
+    original_user_query: str,
+    iteration: int,
+    conversation_summary: str,
+    conversation_history: list[dict],
+    history_payload: list[dict],
+    runtime_constraints: dict,
+    context_snapshot_compact: dict,
+) -> str:
+    convo_lines: list[str] = []
+    for msg in conversation_history[-8:]:
+        if not isinstance(msg, dict):
+            continue
+        role = str(msg.get("role") or "unknown")
+        content = str(msg.get("content") or "").replace("\n", " ").strip()
+        if not content:
+            continue
+        convo_lines.append(f"- {role}: {content[:220]}")
+
+    history_lines: list[str] = []
+    for item in history_payload[-12:]:
+        if not isinstance(item, dict):
+            continue
+        title = str(item.get("title") or "").strip()
+        prefix = f"{title} | " if title else ""
+        history_lines.append(
+            f"- {prefix}{item.get('action_type')}[{item.get('status')}]: {item.get('key_result') or ''}".strip()
+        )
+
+    lines = [
+        f"目标: {original_user_query}",
+        f"轮次: {iteration}",
+        f"运行约束: chat_only={runtime_constraints.get('chat_only')}, force_code_edit={runtime_constraints.get('force_code_edit')}, range=({runtime_constraints.get('range_start')},{runtime_constraints.get('range_end')})",
+    ]
+    if conversation_summary:
+        lines.append(f"历史摘要: {conversation_summary[:600]}")
+    if convo_lines:
+        lines.append("最近对话:")
+        lines.extend(convo_lines)
+    if history_lines:
+        lines.append("最近动作结果:")
+        lines.extend(history_lines)
+
+    ws = context_snapshot_compact.get("workspace", {}) if isinstance(context_snapshot_compact.get("workspace"), dict) else {}
+    lines.append(
+        f"工作区概况: file_count={ws.get('file_count')}, sample_files={len(ws.get('sample_files') or []) if isinstance(ws.get('sample_files'), list) else 0}"
+    )
+    return "\n".join(lines)
+
+
+def _compact_history_output_for_planner(action_type: ActionType, output: object) -> object:
+    if not isinstance(output, dict):
+        if isinstance(output, str) and len(output) > 4000:
+            return output[:4000]
+        return output
+
+    if action_type == ActionType.READ_FILES:
+        files = output.get("files")
+        compact_files: list[dict] = []
+        if isinstance(files, list):
+            for item in files[:20]:
+                if not isinstance(item, dict):
+                    continue
+                compact_files.append(
+                    {
+                        "path": item.get("path"),
+                        "chars": item.get("chars"),
+                        "returned_chars": item.get("returned_chars"),
+                        "content_truncated": item.get("content_truncated"),
+                        "content_truncated_by_budget": item.get("content_truncated_by_budget"),
+                        "content": (str(item.get("content")) if item.get("content") is not None else None),
+                        "error": item.get("error"),
+                    }
+                )
+        return {
+            "files": compact_files,
+            "file_count_requested": output.get("file_count_requested"),
+            "file_count_returned": output.get("file_count_returned"),
+            "total_returned_chars": output.get("total_returned_chars"),
+            "omitted_files_count": output.get("omitted_files_count"),
+            "truncated_by_budget": output.get("truncated_by_budget"),
+        }
+
+    if action_type == ActionType.READ_FILE_RANGES:
+        ranges = output.get("ranges")
+        compact_ranges: list[dict] = []
+        if isinstance(ranges, list):
+            for item in ranges[:30]:
+                if not isinstance(item, dict):
+                    continue
+                compact_ranges.append(
+                    {
+                        "path": item.get("path"),
+                        "start_line": item.get("start_line"),
+                        "end_line": item.get("end_line"),
+                        "effective_start": item.get("effective_start"),
+                        "effective_end": item.get("effective_end"),
+                        "line_count": item.get("line_count"),
+                        "returned_chars": item.get("returned_chars"),
+                        "content_truncated_by_budget": item.get("content_truncated_by_budget"),
+                        "content": (str(item.get("content")) if item.get("content") is not None else None),
+                        "error": item.get("error"),
+                    }
+                )
+        return {
+            "ranges": compact_ranges,
+            "range_count_requested": output.get("range_count_requested"),
+            "range_count_returned": output.get("range_count_returned"),
+            "total_returned_chars": output.get("total_returned_chars"),
+            "omitted_ranges_count": output.get("omitted_ranges_count"),
+            "truncated_by_budget": output.get("truncated_by_budget"),
+        }
+
+    if action_type in {ActionType.RUN_COMMAND, ActionType.RUN_TESTS, ActionType.RUN_LINT, ActionType.RUN_BUILD}:
+        return {
+            "command": output.get("command"),
+            "cwd": output.get("cwd"),
+            "exit_code": output.get("exit_code"),
+            "stdout": str(output.get("stdout") or "")[:1200],
+            "stderr": str(output.get("stderr") or "")[:1200],
+        }
+
+    if action_type == ActionType.EXTRACT_SYMBOLS:
+        ast_items = output.get("ast")
+        compact_ast: list[dict] = []
+        if isinstance(ast_items, list):
+            for item in ast_items[:20]:
+                if not isinstance(item, dict):
+                    continue
+                compact_ast.append(
+                    {
+                        "path": item.get("path"),
+                        "language": item.get("language"),
+                        "summary": item.get("summary"),
+                        "imports": item.get("imports"),
+                        "top_level": item.get("top_level"),
+                        "error": item.get("error"),
+                    }
+                )
+        return {"ast": compact_ast}
+
+    return output
 
 
 async def call_openai(messages: list[dict]) -> tuple[str, dict]:
@@ -963,13 +1213,15 @@ async def plan_actions(
     summary_max_chars = cfg.summary_max_chars if cfg else 1200
 
     # Include recent chat turns so first planning step of each run keeps dialog continuity.
-    recent_messages = request.messages[-turns:]
-    omitted_messages = request.messages[:-turns] if len(request.messages) > turns else []
+    planner_turns = min(turns, 12)
+    planner_msg_chars = min(max_chars_per_message, 600)
+    recent_messages = request.messages[-planner_turns:]
+    omitted_messages = request.messages[:-planner_turns] if len(request.messages) > planner_turns else []
     conversation_history = []
     for msg in recent_messages:
         text = msg.content or ""
-        if len(text) > max_chars_per_message:
-            text = text[:max_chars_per_message]
+        if len(text) > planner_msg_chars:
+            text = text[:planner_msg_chars]
         conversation_history.append(
             {
                 "role": msg.role,
@@ -978,36 +1230,33 @@ async def plan_actions(
         )
     conversation_summary = _build_history_summary(omitted_messages, max_chars=summary_max_chars) if summary_enabled else ""
 
-    history_payload = [
-        {
+    history_payload = []
+    for rec in action_history[-24:]:
+        compact_output = _compact_history_output_for_planner(rec.action_type, rec.output)
+        payload_item = {
             "iteration": rec.iteration,
             "action_id": rec.action_id,
             "action_type": rec.action_type.value,
             "status": rec.status,
             "title": rec.title,
             "error": rec.error,
-            "output": rec.output,
+            "key_result": _extract_key_result_for_planner(rec.action_type, compact_output),
         }
-        for rec in action_history[-40:]
-    ]
+        if rec.action_type in {ActionType.READ_FILES, ActionType.READ_FILE_RANGES, ActionType.EXTRACT_SYMBOLS}:
+            payload_item["output"] = compact_output
+        history_payload.append(payload_item)
+
+    runtime_constraints = {
+        "chat_only": request.chat_only,
+        "force_code_edit": request.force_code_edit,
+        "range_start": request.range_start,
+        "range_end": request.range_end,
+    }
+    compact_context = _compact_context_snapshot_for_planner(context_snapshot)
     planner_input = {
         "original_user_query": original_user_query,
-        "conversation_history": conversation_history,
-        "conversation_omitted_count": max(0, len(request.messages) - len(recent_messages)),
-        "conversation_summary": conversation_summary,
-        "history_config": {
-            "turns": turns,
-            "max_chars_per_message": max_chars_per_message,
-            "summary_enabled": summary_enabled,
-            "summary_max_chars": summary_max_chars,
-        },
         "iteration": iteration,
-        "runtime_constraints": {
-            "chat_only": request.chat_only,
-            "force_code_edit": request.force_code_edit,
-            "range_start": request.range_start,
-            "range_end": request.range_end,
-        },
+        "runtime_constraints": runtime_constraints,
         "current_file": request.current_file,
         "snippets": [
             {
@@ -1015,15 +1264,39 @@ async def plan_actions(
                 "start_line": s.start_line,
                 "end_line": s.end_line,
             }
-            for s in (request.snippets or [])[:50]
+            for s in (request.snippets or [])[:20]
         ],
-        "context_snapshot": context_snapshot,
+        "context_snapshot": compact_context,
+        "conversation_omitted_count": max(0, len(request.messages) - len(recent_messages)),
+        "history_config": {
+            "turns": turns,
+            "max_chars_per_message": max_chars_per_message,
+            "summary_enabled": summary_enabled,
+            "summary_max_chars": summary_max_chars,
+        },
         "prior_actions": history_payload,
         "available_actions": available_actions,
     }
+    planner_brief = _build_planner_brief(
+        original_user_query=original_user_query,
+        iteration=iteration,
+        conversation_summary=conversation_summary,
+        conversation_history=conversation_history,
+        history_payload=history_payload,
+        runtime_constraints=runtime_constraints,
+        context_snapshot_compact=compact_context,
+    )
     messages = [
         {"role": "system", "content": PLANNER_SYSTEM_PROMPT},
-        {"role": "user", "content": json.dumps(planner_input, ensure_ascii=False)},
+        {
+            "role": "user",
+            "content": (
+                "以下是本轮规划简报（优先阅读）：\n"
+                f"{planner_brief}\n\n"
+                "以下是机器状态（JSON，按需引用）：\n"
+                f"{json.dumps(planner_input, ensure_ascii=False)}"
+            ),
+        },
     ]
     callers = {
         AIProvider.OPENAI: call_openai,

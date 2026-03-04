@@ -271,7 +271,7 @@ class ClosedLoopAgent:
             self.run_store.mark_run_result(run, result)
             return self._response_from_run(self.run_store.get(run_id), content=msg, needs_user_trigger=False)
 
-        if batch.decision.mode == "ask_user":
+        if batch.decision.mode == "ask_user" and not batch.actions:
             run = self.run_store.get(run_id)
             self.run_store.update_status(run, "waiting_user")
             run = self.run_store.get(run_id)
@@ -282,18 +282,17 @@ class ClosedLoopAgent:
                 pending_actions=batch.actions,
             )
 
-        waiting = batch.decision.needs_user_trigger and len(batch.actions) > 0
         run = self.run_store.get(run_id)
         if run.pause_requested:
             self.run_store.update_status(run, "paused")
         else:
-            self.run_store.update_status(run, "waiting_user" if waiting else "running")
+            self.run_store.update_status(run, "running")
         run = self.run_store.get(run_id)
 
         return self._response_from_run(
             run,
             content=batch.summary,
-            needs_user_trigger=waiting,
+            needs_user_trigger=False,
             pending_actions=batch.actions,
         )
 
@@ -544,12 +543,23 @@ class ClosedLoopAgent:
                 return f"读取完成，共 {len(ok_files)} 个文件：{', '.join(ok_files[:6])}" + (" ..." if len(ok_files) > 6 else "")
             return "读取完成，未返回文件内容"
 
+        if action.type == ActionType.READ_FILE_RANGES:
+            ranges = output.get("ranges") if isinstance(output, dict) else None
+            if isinstance(ranges, list) and ranges:
+                hit_files = sorted({str(item.get("path")) for item in ranges if isinstance(item, dict) and item.get("path")})
+                return f"范围读取完成，共 {len(ranges)} 段，涉及 {len(hit_files)} 个文件"
+            return "范围读取完成，未返回片段内容"
+
         if action.type == ActionType.SEARCH_CODE:
             query = output.get("query") if isinstance(output, dict) else ""
             matches = output.get("matches") if isinstance(output, dict) else []
+            reason = output.get("reason") if isinstance(output, dict) else None
             if isinstance(matches, list):
                 hit_files = sorted({str(m.get("path")) for m in matches if isinstance(m, dict) and m.get("path")})
-                return f"搜索 `{query}` 命中 {len(matches)} 处，涉及 {len(hit_files)} 个文件"
+                base = f"搜索 `{query}` 命中 {len(matches)} 处，涉及 {len(hit_files)} 个文件"
+                if reason:
+                    return f"{base}（reason={reason}）"
+                return base
             return f"搜索 `{query}` 完成"
 
         if action.type == ActionType.SCAN_WORKSPACE:

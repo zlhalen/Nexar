@@ -85,15 +85,54 @@ class ContextSnapshotBuilder:
                         for item in files[:20]:
                             if not isinstance(item, dict):
                                 continue
-                            copied = dict(item)
-                            content = copied.get("content")
-                            if isinstance(content, str) and len(content) > 20000:
-                                copied["content"] = content[:20000]
-                                copied["content_truncated_by_context"] = True
-                            compact_files.append(copied)
-                        output_for_planner = {"files": compact_files}
-                elif isinstance(output, str) and len(output) > 20000:
-                    output_for_planner = output[:20000]
+                            compact_files.append(
+                                {
+                                    "path": item.get("path"),
+                                    "chars": item.get("chars"),
+                                    "returned_chars": item.get("returned_chars"),
+                                    "content_truncated": item.get("content_truncated"),
+                                    "content_truncated_by_budget": item.get("content_truncated_by_budget"),
+                                    "error": item.get("error"),
+                                }
+                            )
+                        output_for_planner = {
+                            "files": compact_files,
+                            "file_count_requested": output.get("file_count_requested"),
+                            "file_count_returned": output.get("file_count_returned"),
+                            "total_returned_chars": output.get("total_returned_chars"),
+                            "omitted_files_count": output.get("omitted_files_count"),
+                            "truncated_by_budget": output.get("truncated_by_budget"),
+                        }
+                elif rec.action_type.value == ActionType.READ_FILE_RANGES.value and isinstance(output, dict):
+                    ranges = output.get("ranges")
+                    if isinstance(ranges, list):
+                        compact_ranges: list[dict[str, Any]] = []
+                        for item in ranges[:30]:
+                            if not isinstance(item, dict):
+                                continue
+                            compact_ranges.append(
+                                {
+                                    "path": item.get("path"),
+                                    "start_line": item.get("start_line"),
+                                    "end_line": item.get("end_line"),
+                                    "effective_start": item.get("effective_start"),
+                                    "effective_end": item.get("effective_end"),
+                                    "line_count": item.get("line_count"),
+                                    "returned_chars": item.get("returned_chars"),
+                                    "content_truncated_by_budget": item.get("content_truncated_by_budget"),
+                                    "error": item.get("error"),
+                                }
+                            )
+                        output_for_planner = {
+                            "ranges": compact_ranges,
+                            "range_count_requested": output.get("range_count_requested"),
+                            "range_count_returned": output.get("range_count_returned"),
+                            "total_returned_chars": output.get("total_returned_chars"),
+                            "omitted_ranges_count": output.get("omitted_ranges_count"),
+                            "truncated_by_budget": output.get("truncated_by_budget"),
+                        }
+                elif isinstance(output, str) and len(output) > 4000:
+                    output_for_planner = output[:4000]
                 elif isinstance(output, dict):
                     output_for_planner = output
                 recent.append(
